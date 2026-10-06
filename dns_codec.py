@@ -20,8 +20,20 @@ Currently implements the 12-byte DNS header (RFC 1035 section 4.1.1):
 Domain names use the uncompressed label wire format (RFC 1035 section 3.1);
 decode_name also accepts backward compression pointers (section 4.1.4).
 
+A question entry (RFC 1035 section 4.1.2) is an uncompressed name followed
+by the QTYPE and QCLASS 16-bit fields:
+
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                     QNAME                     |
+    /                                               /
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                     QTYPE                     |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                     QCLASS                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+
 Public API: encode_header, decode_header, encode_name, decode_name,
-DNSArgumentError, DNSMessageError.
+encode_question, decode_question, DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -35,6 +47,8 @@ __all__ = [
     "decode_header",
     "encode_name",
     "decode_name",
+    "encode_question",
+    "decode_question",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -135,6 +149,14 @@ def encode_header(header):
 
 
 _FIELD_SET = frozenset(HEADER_FIELDS)
+
+# Fixed field order of a question entry, used for validation, decoding and
+# JSON output.
+QUESTION_FIELDS = ("name", "qtype", "qclass")
+
+_QUESTION_FIELD_SET = frozenset(QUESTION_FIELDS)
+_QUESTION_STRUCT = struct.Struct("!HH")
+_QUESTION_TAIL_SIZE = 4
 
 
 def decode_header(data):
@@ -290,6 +312,59 @@ def decode_name(message, offset=0):
     return ".".join(labels) + ".", next_offset
 
 
+def encode_question(question):
+    """Encode a question mapping into wire bytes (uncompressed name).
+
+    The mapping must contain exactly ``name``, ``qtype`` and ``qclass``;
+    the name follows the encode_name rules and is never compressed. The
+    wire form is the name followed by QTYPE and QCLASS as two network
+    byte order unsigned 16-bit values. Validation is completed before any
+    result is produced; the caller's object is never mutated. Raises
+    DNSArgumentError for any invalid input.
+    """
+    if not isinstance(question, Mapping):
+        raise DNSArgumentError("question must be a mapping")
+
+    for name in QUESTION_FIELDS:
+        if name not in question:
+            raise DNSArgumentError("missing field: %s" % name)
+
+    for key in question:
+        if key not in _QUESTION_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+
+    _check_uint(question["qtype"], "qtype", 16)
+    _check_uint(question["qclass"], "qclass", 16)
+
+    wire_name = encode_name(question["name"])
+
+    return wire_name + _QUESTION_STRUCT.pack(
+        question["qtype"], question["qclass"]
+    )
+
+
+def decode_question(message, offset=0):
+    """Read one question entry from ``message`` starting at ``offset``.
+
+    Returns a ``(question, next_offset)`` tuple where ``question`` is a
+    plain dict in QUESTION_FIELDS order and ``next_offset`` is the first
+    byte after the question in the original message. The name part follows
+    decode_name semantics (compression pointers, jump and expansion
+    limits). Raises DNSArgumentError for invalid arguments and
+    DNSMessageError for malformed wire data.
+    """
+    name, position = decode_name(message, offset)
+
+    if position + _QUESTION_TAIL_SIZE > len(message):
+        raise DNSMessageError("truncated question: missing qtype/qclass")
+
+    qtype, qclass = _QUESTION_STRUCT.unpack(
+        message[position : position + _QUESTION_TAIL_SIZE]
+    )
+
+    return {"name": name, "qtype": qtype, "qclass": qclass}, position + _QUESTION_TAIL_SIZE
+
+
 def _read_limited_input():
     # Read at most one byte past the limit so oversize input is detected
     # without buffering an unbounded stream.
@@ -353,6 +428,36 @@ def _cmd_decode_header():
     return 0
 
 
+def _cmd_encode_question():
+    data = _read_limited_input()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise DNSArgumentError("input is not valid UTF-8")
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        raise DNSArgumentError("input is not valid JSON")
+    if not isinstance(obj, dict):
+        raise DNSArgumentError("JSON input must be an object")
+    wire = encode_question(obj)
+    output = json.dumps({"wire": wire.hex()}, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
+def _cmd_decode_question():
+    data = _read_limited_input()
+    wire = _decode_hex(data)
+    question, end = decode_question(wire)
+    if end != len(wire):
+        # The input must be exactly one complete question entry.
+        raise DNSMessageError("trailing bytes after question")
+    output = json.dumps(question, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -366,12 +471,24 @@ def main(argv=None):
         "decode-header",
         help="read hexadecimal wire bytes from stdin and print the header as JSON",
     )
+    subparsers.add_parser(
+        "encode-question",
+        help="read a UTF-8 JSON question object from stdin and print its hex wire form",
+    )
+    subparsers.add_parser(
+        "decode-question",
+        help="read hexadecimal wire bytes from stdin and print the question as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
         if args.command == "encode-header":
             return _cmd_encode_header()
-        return _cmd_decode_header()
+        if args.command == "decode-header":
+            return _cmd_decode_header()
+        if args.command == "encode-question":
+            return _cmd_encode_question()
+        return _cmd_decode_question()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

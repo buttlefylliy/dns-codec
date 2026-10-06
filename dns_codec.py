@@ -30,9 +30,14 @@ CNAME records (TYPE 5, a single domain name as RDATA, RFC 1035
 section 3.3.1) and NS records (TYPE 2, a single domain name as RDATA,
 RFC 1035 section 3.3.11) are supported here.
 
+A full message (RFC 1035 section 4.1) is the header followed by the
+question, answer, authority and additional sections; encode_message and
+decode_message handle that composition.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
-decode_resource_record, DNSArgumentError, DNSMessageError.
+decode_resource_record, encode_message, decode_message,
+DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -50,6 +55,8 @@ __all__ = [
     "decode_question",
     "encode_resource_record",
     "decode_resource_record",
+    "encode_message",
+    "decode_message",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -683,6 +690,158 @@ def decode_resource_record(message, offset=0):
     }, rdata_end
 
 
+# Fixed top-level key order of a full message mapping, used for
+# validation, decoding and JSON output. Each count field of the header
+# covers the section listed at the same position here.
+MESSAGE_FIELDS = ("header", "questions", "answers", "authorities", "additionals")
+
+_MESSAGE_FIELD_SET = frozenset(MESSAGE_FIELDS)
+# (section key, header count field) pairs in wire order.
+_MESSAGE_SECTIONS = (
+    ("questions", "qdcount"),
+    ("answers", "ancount"),
+    ("authorities", "nscount"),
+    ("additionals", "arcount"),
+)
+
+
+def _check_section(value, name):
+    if not isinstance(value, (list, tuple)):
+        raise DNSArgumentError("field '%s' must be a list" % name)
+
+
+def encode_message(message):
+    """Encode a full DNS message mapping into wire bytes (network order).
+
+    The mapping must contain exactly the keys header, questions, answers,
+    authorities and additionals (in any order): a header mapping as
+    accepted by encode_header and four lists of question or resource
+    record mappings as accepted by encode_question and
+    encode_resource_record. The header counts qdcount, ancount, nscount
+    and arcount must equal the actual number of entries in the matching
+    section. The wire form is the header followed by the question,
+    answer, authority and additional sections, with every name written
+    uncompressed; the total must not exceed 65535 bytes. Validation is
+    completed before any result is produced; the caller's object is
+    never mutated. Raises DNSArgumentError for any invalid input.
+    """
+    if not isinstance(message, Mapping):
+        raise DNSArgumentError("message must be a mapping")
+
+    for name in MESSAGE_FIELDS:
+        if name not in message:
+            raise DNSArgumentError("missing field: %s" % name)
+
+    for key in message:
+        if key not in _MESSAGE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+
+    header = message["header"]
+    sections = {}
+    for section, _count_field in _MESSAGE_SECTIONS:
+        value = message[section]
+        _check_section(value, section)
+        sections[section] = value
+
+    # Validate the header (field shapes and ranges) before comparing
+    # its counts against the sections.
+    encoded_header = encode_header(header)
+    for section, count_field in _MESSAGE_SECTIONS:
+        expected = header[count_field]
+        actual = len(sections[section])
+        if expected != actual:
+            raise DNSArgumentError(
+                "header field '%s' is %d but '%s' has %d entr%s"
+                % (
+                    count_field,
+                    expected,
+                    section,
+                    actual,
+                    "y" if actual == 1 else "ies",
+                )
+            )
+
+    pieces = [encoded_header]
+    total = len(encoded_header)
+    for question in sections["questions"]:
+        piece = encode_question(question)
+        pieces.append(piece)
+        total += len(piece)
+    for section, _count_field in _MESSAGE_SECTIONS[1:]:
+        for record in sections[section]:
+            piece = encode_resource_record(record)
+            pieces.append(piece)
+            total += len(piece)
+
+    if total > MAX_MESSAGE_LENGTH:
+        raise DNSArgumentError(
+            "message exceeds %d bytes" % MAX_MESSAGE_LENGTH
+        )
+
+    return b"".join(pieces)
+
+
+def decode_message(data):
+    """Decode a complete DNS message from wire bytes.
+
+    Returns a plain dict with keys in the fixed order header, questions,
+    answers, authorities, additionals; the header and every entry keep
+    the key order of decode_header, decode_question and
+    decode_resource_record. The header is read first, then exactly
+    qdcount questions and ancount, nscount and arcount resource records
+    from their sections; names may use the legal backward compression
+    pointers accepted by decode_name. Raises DNSArgumentError when
+    ``data`` is not bytes or exceeds 65535 bytes and DNSMessageError
+    when the header is truncated, a counted entry is truncated or
+    malformed, a record type is unsupported, or bytes remain after the
+    additional section; no partial result is returned on failure.
+    """
+    if not isinstance(data, bytes):
+        raise DNSArgumentError("wire data must be bytes")
+    if len(data) > MAX_MESSAGE_LENGTH:
+        raise DNSArgumentError(
+            "message exceeds %d bytes" % MAX_MESSAGE_LENGTH
+        )
+    if len(data) < HEADER_SIZE:
+        raise DNSMessageError(
+            "DNS message must contain at least the %d-byte header, got %d"
+            % (HEADER_SIZE, len(data))
+        )
+
+    header = decode_header(data[:HEADER_SIZE])
+    position = HEADER_SIZE
+
+    questions = []
+    for _ in range(header["qdcount"]):
+        if position >= len(data):
+            raise DNSMessageError("truncated question section")
+        question, position = decode_question(data, position)
+        questions.append(question)
+
+    sections = {}
+    for section, count_field in _MESSAGE_SECTIONS[1:]:
+        records = []
+        for _ in range(header[count_field]):
+            if position >= len(data):
+                raise DNSMessageError("truncated %s section" % section)
+            record, position = decode_resource_record(data, position)
+            records.append(record)
+        sections[section] = records
+
+    if position != len(data):
+        raise DNSMessageError(
+            "trailing bytes after message: %d byte(s)" % (len(data) - position)
+        )
+
+    return {
+        "header": header,
+        "questions": questions,
+        "answers": sections["answers"],
+        "authorities": sections["authorities"],
+        "additionals": sections["additionals"],
+    }
+
+
 def _read_limited_input():
     # Read at most one byte past the limit so oversize input is detected
     # without buffering an unbounded stream.
@@ -817,6 +976,37 @@ def _cmd_decode_record():
     return 0
 
 
+def _cmd_encode_message():
+    data = _read_limited_input()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise DNSArgumentError("input is not valid UTF-8")
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        raise DNSArgumentError("input is not valid JSON")
+    if not isinstance(obj, dict):
+        raise DNSArgumentError("JSON input must be an object")
+    wire = encode_message(obj)
+    output = json.dumps({"wire": wire.hex()}, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
+def _cmd_decode_message():
+    data = _read_limited_input()
+    wire = _decode_hex(data)
+    if not wire:
+        # An empty message cannot even hold the header, hence a message
+        # error (exit code 3).
+        raise DNSMessageError("truncated message: empty input")
+    message = decode_message(wire)
+    output = json.dumps(message, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -846,6 +1036,14 @@ def main(argv=None):
         "decode-record",
         help="read hexadecimal wire bytes from stdin and print the A/AAAA/CNAME/NS record as JSON",
     )
+    subparsers.add_parser(
+        "encode-message",
+        help="read a UTF-8 JSON message object from stdin and print its hex wire form",
+    )
+    subparsers.add_parser(
+        "decode-message",
+        help="read hexadecimal wire bytes from stdin and print the full message as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -859,7 +1057,11 @@ def main(argv=None):
             return _cmd_decode_question()
         if args.command == "encode-record":
             return _cmd_encode_record()
-        return _cmd_decode_record()
+        if args.command == "decode-record":
+            return _cmd_decode_record()
+        if args.command == "encode-message":
+            return _cmd_encode_message()
+        return _cmd_decode_message()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

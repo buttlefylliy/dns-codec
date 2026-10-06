@@ -24,8 +24,9 @@ A question entry (RFC 1035 section 4.1.2) is a domain name followed by the
 QTYPE and QCLASS unsigned 16-bit values in network byte order.
 
 A resource record (RFC 1035 section 4.1.3) is a domain name followed by
-TYPE, CLASS, TTL, RDLENGTH and RDATA; only A records (TYPE 1, four-octet
-IPv4 RDATA) are supported here.
+TYPE, CLASS, TTL, RDLENGTH and RDATA; A records (TYPE 1, four-octet IPv4
+RDATA) and AAAA records (TYPE 28, sixteen-octet IPv6 RDATA, RFC 3596)
+are supported here.
 
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
@@ -33,6 +34,7 @@ decode_resource_record, DNSArgumentError, DNSMessageError.
 """
 
 import argparse
+import ipaddress
 import json
 import struct
 import sys
@@ -79,6 +81,8 @@ _QUESTION_STRUCT = struct.Struct("!HH")
 _RECORD_FIXED_STRUCT = struct.Struct("!HHIH")
 _TYPE_A = 1
 _A_RDATA_LENGTH = 4
+_TYPE_AAAA = 28
+_AAAA_RDATA_LENGTH = 16
 HEADER_SIZE = 12
 _INPUT_LIMIT = 4096
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -409,16 +413,48 @@ def _parse_ipv4(address):
     return octets
 
 
+def _parse_ipv6(address):
+    # Strict textual IPv6 (RFC 4291 section 2.2): hexadecimal groups in
+    # either case, optional "::" compression and IPv4-embedded tails are
+    # accepted; surrounding whitespace, zone identifiers and prefix
+    # lengths are not. Returns the 16 network-order RDATA bytes.
+    if not isinstance(address, str):
+        raise DNSArgumentError("field 'address' must be a string")
+    if not address or address != address.strip():
+        raise DNSArgumentError(
+            "field 'address' must not have surrounding whitespace"
+        )
+    if "%" in address:
+        raise DNSArgumentError(
+            "field 'address' must not contain a zone identifier"
+        )
+    if "/" in address:
+        raise DNSArgumentError(
+            "field 'address' must not contain a network prefix"
+        )
+    try:
+        return ipaddress.IPv6Address(address).packed
+    except ipaddress.AddressValueError:
+        raise DNSArgumentError(
+            "field 'address' is not a valid IPv6 address"
+        )
+
+
 def encode_resource_record(record):
-    """Encode one A resource record mapping into wire bytes.
+    """Encode one A or AAAA resource record mapping into wire bytes.
 
     The mapping must contain exactly the keys name, type, class, ttl and
-    address (in any order). The name is written uncompressed; ``type`` must
-    be the integer 1 (A), ``class`` a 16-bit and ``ttl`` a 32-bit unsigned
-    integer (bools are never accepted), and ``address`` a dotted-decimal
-    IPv4 string without leading zeros. RDLENGTH is fixed to 4. Validation
-    is completed before any result is produced; the caller's object is
-    never mutated. Raises DNSArgumentError for any invalid input.
+    address (in any order). The name is written uncompressed; ``type``
+    must be the integer 1 (A) or 28 (AAAA), ``class`` a 16-bit and
+    ``ttl`` a 32-bit unsigned integer (bools are never accepted). For
+    type 1, ``address`` is a dotted-decimal IPv4 string without leading
+    zeros and RDLENGTH is fixed to 4; for type 28, ``address`` is a
+    textual IPv6 address (any mix of hexadecimal case, leading zeros,
+    "::" compression and IPv4-embedded forms, but no surrounding
+    whitespace, zone identifier or prefix length) and RDLENGTH is fixed
+    to 16. Validation is completed before any result is produced; the
+    caller's object is never mutated. Raises DNSArgumentError for any
+    invalid input.
     """
     if not isinstance(record, Mapping):
         raise DNSArgumentError("record must be a mapping")
@@ -440,31 +476,65 @@ def encode_resource_record(record):
     # Validate all inputs before producing any output.
     encoded_name = encode_name(name)
     _check_uint(rtype, "type", 16)
-    if rtype != _TYPE_A:
-        raise DNSArgumentError("field 'type' must be 1 (A)")
+    if rtype not in (_TYPE_A, _TYPE_AAAA):
+        raise DNSArgumentError("field 'type' must be 1 (A) or 28 (AAAA)")
     _check_uint(rclass, "class", 16)
     _check_uint(ttl, "ttl", 32)
-    octets = _parse_ipv4(address)
+    if rtype == _TYPE_A:
+        rdata = bytes(_parse_ipv4(address))
+    else:
+        rdata = _parse_ipv6(address)
 
     return (
         encoded_name
-        + _RECORD_FIXED_STRUCT.pack(rtype, rclass, ttl, _A_RDATA_LENGTH)
-        + bytes(octets)
+        + _RECORD_FIXED_STRUCT.pack(rtype, rclass, ttl, len(rdata))
+        + rdata
     )
 
 
+def _format_ipv6(rdata):
+    # Canonical textual form (RFC 5952 section 4): lowercase hexadecimal
+    # without leading zeros, only the longest run of at least two zero
+    # groups is compressed (the leftmost such run on ties); IPv4-embedded
+    # addresses are rendered as plain hextets like any other address.
+    hextets = ["%x" % value for value in struct.unpack("!8H", rdata)]
+    best_start = -1
+    best_len = 0
+    run_start = -1
+    run_len = 0
+    for index, hextet in enumerate(hextets):
+        if hextet == "0":
+            if run_len == 0:
+                run_start = index
+            run_len += 1
+            if run_len > best_len:
+                best_start = run_start
+                best_len = run_len
+        else:
+            run_len = 0
+    if best_len < 2:
+        return ":".join(hextets)
+    head = ":".join(hextets[:best_start])
+    tail = ":".join(hextets[best_start + best_len:])
+    return head + "::" + tail
+
+
 def decode_resource_record(message, offset=0):
-    """Read one A resource record from ``message`` starting at ``offset``.
+    """Read one A or AAAA resource record from ``message`` starting at ``offset``.
 
     Returns a ``(record, next_offset)`` tuple: ``record`` is a plain dict
     with keys in the fixed order name, type, class, ttl, address, and
     ``next_offset`` is the first byte after the record in the original
     message. The owner name follows the same compression-pointer rules as
-    decode_name; the address is rendered in canonical dotted decimal
-    without leading zeros. Raises DNSArgumentError for invalid arguments
-    and DNSMessageError for malformed wire data (truncated name, fixed
-    fields or RDATA, a non-A TYPE, or an RDLENGTH other than 4); no
-    partial result is returned on failure.
+    decode_name. An A address is rendered in canonical dotted decimal
+    without leading zeros; an AAAA address is rendered in canonical
+    textual form (RFC 5952): lowercase hexadecimal without leading zeros,
+    with only the longest run of at least two zero groups compressed
+    (the leftmost such run on ties), IPv4-embedded addresses included.
+    Raises DNSArgumentError for invalid arguments and DNSMessageError for
+    malformed wire data (truncated name, fixed fields or RDATA, a TYPE
+    other than A or AAAA, or an RDLENGTH other than 4 for A or 16 for
+    AAAA); no partial result is returned on failure.
     """
     if not isinstance(message, bytes):
         raise DNSArgumentError("message must be bytes")
@@ -489,18 +559,30 @@ def decode_resource_record(message, offset=0):
         message[position:fixed_end]
     )
 
-    if rtype != _TYPE_A:
-        raise DNSMessageError("unsupported record type: %d (only A is supported)" % rtype)
-    if rdlength != _A_RDATA_LENGTH:
+    if rtype == _TYPE_A:
+        if rdlength != _A_RDATA_LENGTH:
+            raise DNSMessageError(
+                "A record RDLENGTH must be %d, got %d" % (_A_RDATA_LENGTH, rdlength)
+            )
+    elif rtype == _TYPE_AAAA:
+        if rdlength != _AAAA_RDATA_LENGTH:
+            raise DNSMessageError(
+                "AAAA record RDLENGTH must be %d, got %d"
+                % (_AAAA_RDATA_LENGTH, rdlength)
+            )
+    else:
         raise DNSMessageError(
-            "A record RDLENGTH must be %d, got %d" % (_A_RDATA_LENGTH, rdlength)
+            "unsupported record type: %d (only A and AAAA are supported)" % rtype
         )
 
     rdata_end = fixed_end + rdlength
     if rdata_end > len(message):
         raise DNSMessageError("truncated RDATA")
 
-    address = ".".join(str(octet) for octet in message[fixed_end:rdata_end])
+    if rtype == _TYPE_A:
+        address = ".".join(str(octet) for octet in message[fixed_end:rdata_end])
+    else:
+        address = _format_ipv6(message[fixed_end:rdata_end])
 
     return {
         "name": name,
@@ -668,11 +750,11 @@ def main(argv=None):
     )
     subparsers.add_parser(
         "encode-record",
-        help="read a UTF-8 JSON A record object from stdin and print its hex wire form",
+        help="read a UTF-8 JSON A/AAAA record object from stdin and print its hex wire form",
     )
     subparsers.add_parser(
         "decode-record",
-        help="read hexadecimal wire bytes from stdin and print the A record as JSON",
+        help="read hexadecimal wire bytes from stdin and print the A/AAAA record as JSON",
     )
     args = parser.parse_args(argv)
 

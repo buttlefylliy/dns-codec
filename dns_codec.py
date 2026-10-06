@@ -17,7 +17,11 @@ Currently implements the 12-byte DNS header (RFC 1035 section 4.1.1):
     |                    ARCOUNT                    |
     +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
 
-Public API: encode_header, decode_header, DNSArgumentError, DNSMessageError.
+Domain names use the uncompressed label wire format (RFC 1035 section 3.1);
+decode_name also accepts backward compression pointers (section 4.1.4).
+
+Public API: encode_header, decode_header, encode_name, decode_name,
+DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -29,6 +33,8 @@ from collections.abc import Mapping
 __all__ = [
     "encode_header",
     "decode_header",
+    "encode_name",
+    "decode_name",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -56,6 +62,12 @@ _HEADER_STRUCT = struct.Struct("!HBBHHHH")
 HEADER_SIZE = 12
 _INPUT_LIMIT = 4096
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+MAX_LABEL_LENGTH = 63
+MAX_NAME_LENGTH = 255
+MAX_MESSAGE_LENGTH = 65535
+MAX_COMPRESSION_POINTERS = 128
+_POINTER_BITS = 0xC0
 
 
 class DNSArgumentError(ValueError):
@@ -155,6 +167,127 @@ def decode_header(data):
         "nscount": ns,
         "arcount": ar,
     }
+
+
+def encode_name(name):
+    """Encode an ASCII absolute domain name into uncompressed wire bytes.
+
+    The root is written as ``"."``; every other name must end with a dot.
+    Labels keep their original case. Raises DNSArgumentError for any invalid
+    input; the argument is never mutated.
+    """
+    if not isinstance(name, str):
+        raise DNSArgumentError("name must be a string")
+    if not name.endswith("."):
+        raise DNSArgumentError("name must be absolute and end with '.'")
+
+    # Drop the single trailing dot; the root (".") then yields no labels.
+    body = name[:-1]
+    labels = body.split(".") if body else []
+
+    pieces = []
+    total = 1  # the terminating zero length octet
+    for label in labels:
+        if label == "":
+            raise DNSArgumentError("empty label in name")
+        try:
+            encoded = label.encode("ascii")
+        except UnicodeEncodeError:
+            raise DNSArgumentError("name must contain ASCII characters only")
+        if len(encoded) > MAX_LABEL_LENGTH:
+            raise DNSArgumentError(
+                "label exceeds %d bytes: %r" % (MAX_LABEL_LENGTH, label)
+            )
+        total += 1 + len(encoded)
+        if total > MAX_NAME_LENGTH:
+            raise DNSArgumentError(
+                "wire name exceeds %d bytes" % MAX_NAME_LENGTH
+            )
+        pieces.append(bytes((len(encoded),)) + encoded)
+
+    return b"".join(pieces) + b"\x00"
+
+
+def decode_name(message, offset=0):
+    """Read a domain name from ``message`` starting at ``offset``.
+
+    Returns an ``(absolute_name, next_offset)`` tuple where ``next_offset``
+    is the first byte after the name at its original location (a two-byte
+    compression pointer is skipped as a whole). Raises DNSArgumentError for
+    invalid arguments and DNSMessageError for malformed wire data.
+    """
+    if not isinstance(message, bytes):
+        raise DNSArgumentError("message must be bytes")
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise DNSArgumentError("offset must be an integer")
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise DNSArgumentError(
+            "message exceeds %d bytes" % MAX_MESSAGE_LENGTH
+        )
+    if offset < 0 or offset >= len(message):
+        # offset == len(message) is still out of bounds: a name always
+        # occupies at least one byte.
+        raise DNSArgumentError("offset out of bounds")
+
+    labels = []
+    name_bytes = 0
+    position = offset
+    pointer_follows = 0
+    # The offset to return: advanced only through labels at the original
+    # position; it jumps over the first pointer's two bytes and then stops.
+    next_offset = None
+
+    while True:
+        if position >= len(message):
+            raise DNSMessageError("truncated name: missing length octet")
+        length = message[position]
+
+        if length == 0:
+            if next_offset is None:
+                next_offset = position + 1
+            break
+
+        if (length & _POINTER_BITS) == _POINTER_BITS:
+            # A pointer occupies two octets; the second must be present.
+            if position + 1 >= len(message):
+                raise DNSMessageError("truncated compression pointer")
+            if pointer_follows >= MAX_COMPRESSION_POINTERS:
+                raise DNSMessageError(
+                    "too many compression pointers (limit %d)"
+                    % MAX_COMPRESSION_POINTERS
+                )
+            target = ((length & 0x3F) << 8) | message[position + 1]
+            if target >= position:
+                raise DNSMessageError("compression pointer does not point back")
+            if next_offset is None:
+                next_offset = position + 2
+            pointer_follows += 1
+            position = target
+            continue
+
+        if length & _POINTER_BITS:
+            # 01 and 10 prefixes are reserved (RFC 1035 section 4.1.4).
+            raise DNSMessageError("reserved label type prefix: %#04x" % length)
+
+        start = position + 1
+        end = start + length
+        if end > len(message):
+            raise DNSMessageError("truncated label")
+        label_bytes = message[start:end]
+        try:
+            label = label_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            raise DNSMessageError("label is not ASCII")
+
+        name_bytes += 1 + length
+        if name_bytes > MAX_NAME_LENGTH - 1:
+            raise DNSMessageError(
+                "expanded name exceeds %d bytes" % MAX_NAME_LENGTH
+            )
+        labels.append(label)
+        position = end
+
+    return ".".join(labels) + ".", next_offset
 
 
 def _read_limited_input():

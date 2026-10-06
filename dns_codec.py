@@ -28,9 +28,10 @@ TYPE, CLASS, TTL, RDLENGTH and RDATA; only A records (TYPE 1, four-octet
 IPv4 RDATA), AAAA records (TYPE 28, sixteen-octet IPv6 RDATA, RFC 3596),
 CNAME records (TYPE 5, a single domain name as RDATA, RFC 1035
 section 3.3.1), NS records (TYPE 2, a single domain name as RDATA,
-RFC 1035 section 3.3.11) and TXT records (TYPE 16, one or more
-length-prefixed character-strings as RDATA, RFC 1035 section 3.3.14)
-are supported here.
+RFC 1035 section 3.3.11), SOA records (TYPE 6, two domain names
+followed by five 32-bit unsigned values, RFC 1035 section 3.3.13) and
+TXT records (TYPE 16, one or more length-prefixed character-strings as
+RDATA, RFC 1035 section 3.3.14) are supported here.
 
 A full message (RFC 1035 section 4.1) is the header followed by the
 question, answer, authority and additional sections; encode_message and
@@ -89,6 +90,20 @@ CNAME_RECORD_FIELDS = ("name", "type", "class", "ttl", "target")
 
 NS_RECORD_FIELDS = ("name", "type", "class", "ttl", "target")
 
+SOA_RECORD_FIELDS = (
+    "name",
+    "type",
+    "class",
+    "ttl",
+    "mname",
+    "rname",
+    "serial",
+    "refresh",
+    "retry",
+    "expire",
+    "minimum",
+)
+
 TXT_RECORD_FIELDS = ("name", "type", "class", "ttl", "strings")
 
 _FLAG_FIELDS = frozenset(("qr", "aa", "tc", "rd", "ra"))
@@ -97,13 +112,16 @@ _HEADER_STRUCT = struct.Struct("!HBBHHHH")
 _QUESTION_STRUCT = struct.Struct("!HH")
 _RECORD_FIXED_STRUCT = struct.Struct("!HHIH")
 _AAAA_STRUCT = struct.Struct("!8H")
+_SOA_TIMERS_STRUCT = struct.Struct("!5I")
 _TYPE_A = 1
 _TYPE_NS = 2
 _TYPE_CNAME = 5
+_TYPE_SOA = 6
 _TYPE_TXT = 16
 _TYPE_AAAA = 28
 _A_RDATA_LENGTH = 4
 _AAAA_RDATA_LENGTH = 16
+_SOA_TIMERS_LENGTH = _SOA_TIMERS_STRUCT.size
 HEADER_SIZE = 12
 _INPUT_LIMIT = 4096
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -406,7 +424,11 @@ def decode_question(message, offset=0):
 
 _RECORD_BASE_FIELDS = ("name", "type", "class", "ttl")
 _RECORD_FIELD_SET = frozenset(
-    RECORD_FIELDS + CNAME_RECORD_FIELDS + NS_RECORD_FIELDS + TXT_RECORD_FIELDS
+    RECORD_FIELDS
+    + CNAME_RECORD_FIELDS
+    + NS_RECORD_FIELDS
+    + SOA_RECORD_FIELDS
+    + TXT_RECORD_FIELDS
 )
 
 
@@ -523,6 +545,39 @@ def _format_ipv6(groups):
     return left + "::" + right
 
 
+def _encode_soa_rdata(record):
+    # RDATA is mname and rname in uncompressed wire form, followed by
+    # serial, refresh, retry, expire and minimum as five network-order
+    # 32-bit unsigned integers.
+    soa_fields = ("mname", "rname", "serial", "refresh", "retry",
+                  "expire", "minimum")
+    for field_name in soa_fields:
+        if field_name not in record:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    mname = encode_name(record["mname"])
+    rname = encode_name(record["rname"])
+    timers = []
+    for field_name in ("serial", "refresh", "retry", "expire", "minimum"):
+        value = record[field_name]
+        _check_uint(value, field_name, 32)
+        timers.append(value)
+    return mname + rname + _SOA_TIMERS_STRUCT.pack(*timers)
+
+
+def _reject_soa_fields(record):
+    for field_name in (
+        "mname",
+        "rname",
+        "serial",
+        "refresh",
+        "retry",
+        "expire",
+        "minimum",
+    ):
+        if field_name in record:
+            raise DNSArgumentError("unknown field: %s" % field_name)
+
+
 def _encode_txt_strings(strings):
     # Each element is an even-length hexadecimal string (either letter
     # case) standing for zero to 255 raw bytes; the wire form is a
@@ -555,30 +610,37 @@ def _encode_txt_strings(strings):
 
 
 def encode_resource_record(record):
-    """Encode one A, AAAA, CNAME, NS or TXT resource record mapping into wire bytes.
+    """Encode one A, AAAA, CNAME, NS, SOA or TXT resource record mapping into wire bytes.
 
     The mapping must contain exactly the keys name, type, class, ttl and
     address (A and AAAA), name, type, class, ttl and target (CNAME and
-    NS) or name, type, class, ttl and strings (TXT), in any order. The
-    name is written uncompressed; ``type`` must be the integer 1 (A),
-    2 (NS), 5 (CNAME), 16 (TXT) or 28 (AAAA), ``class`` a 16-bit and
-    ``ttl`` a 32-bit unsigned integer (bools are never accepted). For
-    type 1 ``address`` is a dotted-decimal IPv4 string without leading
-    zeros, for type 28 an IPv6 text form (either hex case, leading zeros,
-    "::" compression and IPv4-embedded forms accepted; no whitespace, zone
-    identifier or prefix length); RDLENGTH is then fixed to 4 or 16 and
-    RDATA is the address in network byte order, so different legal
-    spellings of the same address produce identical bytes. For types 2
-    and 5 ``target`` follows the same absolute ASCII domain name rules as
-    ``name`` (the root ``"."`` included) and RDATA is the target name in
-    uncompressed wire form, with RDLENGTH set to its actual length. For
-    type 16 ``strings`` is a non-empty list or tuple of even-length
-    hexadecimal strings (either letter case, ``""`` for a zero-length
-    segment), each standing for zero to 255 raw bytes; RDATA is each
-    segment as a one-octet length followed by the raw bytes, in order,
-    and RDLENGTH is the total (never above 65535 bytes). Validation is
-    completed before any result is produced; the caller's object is
-    never mutated. Raises DNSArgumentError for any invalid input.
+    NS), name, type, class, ttl, mname, rname, serial, refresh, retry,
+    expire and minimum (SOA) or name, type, class, ttl and strings
+    (TXT), in any order. The name is written uncompressed; ``type`` must
+    be the integer 1 (A), 2 (NS), 5 (CNAME), 6 (SOA), 16 (TXT) or 28
+    (AAAA), ``class`` a 16-bit and ``ttl`` a 32-bit unsigned integer
+    (bools are never accepted). For type 1 ``address`` is a
+    dotted-decimal IPv4 string without leading zeros, for type 28 an
+    IPv6 text form (either hex case, leading zeros, "::" compression
+    and IPv4-embedded forms accepted; no whitespace, zone identifier or
+    prefix length); RDLENGTH is then fixed to 4 or 16 and RDATA is the
+    address in network byte order, so different legal spellings of the
+    same address produce identical bytes. For types 2 and 5 ``target``
+    follows the same absolute ASCII domain name rules as ``name`` (the
+    root ``"."`` included) and RDATA is the target name in uncompressed
+    wire form, with RDLENGTH set to its actual length. For type 6
+    ``mname`` and ``rname`` follow the same absolute ASCII domain name
+    rules as ``name`` (the root ``"."`` included) and RDATA is the
+    mname, the rname and serial, refresh, retry, expire and minimum as
+    five network-order 32-bit unsigned integers, concatenated in that
+    order; RDLENGTH is the actual total length. For type 16 ``strings``
+    is a non-empty list or tuple of even-length hexadecimal strings
+    (either letter case, ``""`` for a zero-length segment), each
+    standing for zero to 255 raw bytes; RDATA is each segment as a
+    one-octet length followed by the raw bytes, in order, and RDLENGTH
+    is the total (never above 65535 bytes). Validation is completed
+    before any result is produced; the caller's object is never mutated.
+    Raises DNSArgumentError for any invalid input.
     """
     if not isinstance(record, Mapping):
         raise DNSArgumentError("record must be a mapping")
@@ -604,6 +666,7 @@ def encode_resource_record(record):
             raise DNSArgumentError("unknown field: target")
         if "strings" in record:
             raise DNSArgumentError("unknown field: strings")
+        _reject_soa_fields(record)
         if "address" not in record:
             raise DNSArgumentError("missing field: address")
         if rtype == _TYPE_A:
@@ -615,20 +678,31 @@ def encode_resource_record(record):
             raise DNSArgumentError("unknown field: address")
         if "strings" in record:
             raise DNSArgumentError("unknown field: strings")
+        _reject_soa_fields(record)
         if "target" not in record:
             raise DNSArgumentError("missing field: target")
         rdata = encode_name(record["target"])
+    elif rtype == _TYPE_SOA:
+        if "address" in record:
+            raise DNSArgumentError("unknown field: address")
+        if "target" in record:
+            raise DNSArgumentError("unknown field: target")
+        if "strings" in record:
+            raise DNSArgumentError("unknown field: strings")
+        rdata = _encode_soa_rdata(record)
     elif rtype == _TYPE_TXT:
         if "address" in record:
             raise DNSArgumentError("unknown field: address")
         if "target" in record:
             raise DNSArgumentError("unknown field: target")
+        _reject_soa_fields(record)
         if "strings" not in record:
             raise DNSArgumentError("missing field: strings")
         rdata = _encode_txt_strings(record["strings"])
     else:
         raise DNSArgumentError(
-            "field 'type' must be 1 (A), 2 (NS), 5 (CNAME), 16 (TXT) or 28 (AAAA)"
+            "field 'type' must be 1 (A), 2 (NS), 5 (CNAME), 6 (SOA),"
+            " 16 (TXT) or 28 (AAAA)"
         )
     _check_uint(rclass, "class", 16)
     _check_uint(ttl, "ttl", 32)
@@ -641,35 +715,45 @@ def encode_resource_record(record):
 
 
 def decode_resource_record(message, offset=0):
-    """Read one A, AAAA, CNAME, NS or TXT resource record from ``message``.
+    """Read one A, AAAA, CNAME, NS, SOA or TXT resource record from ``message``.
 
     Returns a ``(record, next_offset)`` tuple: ``record`` is a plain dict
     with keys in the fixed order name, type, class, ttl, address (A and
-    AAAA), name, type, class, ttl, target (CNAME and NS) or name, type,
-    class, ttl, strings (TXT), and ``next_offset`` is the first byte
-    after the record's declared RDATA in the original message, regardless
-    of any compression pointers inside it. The owner name follows the
-    same compression-pointer rules as decode_name; an A address is
-    rendered in canonical dotted decimal without leading zeros, an AAAA
-    address in canonical IPv6 text form (lowercase hex, no leading zeros,
-    the longest run of at least two zero groups compressed, leftmost run
-    on a tie; IPv4-embedded addresses are rendered in the same
-    hexadecimal form). CNAME and NS targets are decoded as a complete
-    domain name inside the declared RDATA (backward compression pointers
-    accepted as for decode_name, label case preserved) and the declared
-    RDATA region must hold exactly that one name. TXT RDATA is read
+    AAAA), name, type, class, ttl, target (CNAME and NS), name, type,
+    class, ttl, mname, rname, serial, refresh, retry, expire, minimum
+    (SOA) or name, type, class, ttl, strings (TXT), and
+    ``next_offset`` is the first byte after the record's declared RDATA
+    in the original message, regardless of any compression pointers
+    inside it. The owner name follows the same compression-pointer rules
+    as decode_name; an A address is rendered in canonical dotted decimal
+    without leading zeros, an AAAA address in canonical IPv6 text form
+    (lowercase hex, no leading zeros, the longest run of at least two
+    zero groups compressed, leftmost run on a tie; IPv4-embedded
+    addresses are rendered in the same hexadecimal form). CNAME and NS
+    targets are decoded as a complete domain name inside the declared
+    RDATA (backward compression pointers accepted as for decode_name,
+    label case preserved) and the declared RDATA region must hold
+    exactly that one name. SOA RDATA is read strictly inside the
+    declared RDLENGTH as mname and rname, each decoded as for CNAME
+    targets (backward compression pointers accepted, label case
+    preserved, their raw encoding kept inside the declared region),
+    followed by exactly serial, refresh, retry, expire and minimum as
+    five network-order 32-bit unsigned integers; next_offset still
+    points at the end of the declared RDATA. TXT RDATA is read
     strictly inside the declared RDLENGTH as a sequence of length-prefixed
     character-strings (name compression is never interpreted there);
     ``strings`` keeps the segment order and renders each segment as
     lowercase hexadecimal (``""`` for a zero-length segment). Raises
     DNSArgumentError for invalid arguments and DNSMessageError for
     malformed wire data (truncated name, fixed fields or RDATA, a TYPE
-    other than A, AAAA, CNAME, NS or TXT, an RDLENGTH other than 4 for A
-    or 16 for AAAA, a zero CNAME, NS or TXT RDLENGTH, a CNAME or NS RDATA
-    region that does not contain exactly one domain name, a TXT RDATA
-    region that does not decompose exactly into complete
-    character-strings, or a malformed name or compression pointer); no
-    partial result is returned on failure.
+    other than A, AAAA, CNAME, NS, SOA or TXT, an RDLENGTH other than 4
+    for A or 16 for AAAA, a zero CNAME, NS, SOA or TXT RDLENGTH, a
+    CNAME or NS RDATA region that does not contain exactly one domain
+    name, an SOA RDATA region that does not contain exactly mname,
+    rname and five 32-bit integers, a TXT RDATA region that does not
+    decompose exactly into complete character-strings, or a malformed
+    name or compression pointer); no partial result is returned on
+    failure.
     """
     if not isinstance(message, bytes):
         raise DNSArgumentError("message must be bytes")
@@ -698,12 +782,17 @@ def decode_resource_record(message, offset=0):
         expected_rdlength = _A_RDATA_LENGTH
     elif rtype == _TYPE_AAAA:
         expected_rdlength = _AAAA_RDATA_LENGTH
-    elif rtype == _TYPE_CNAME or rtype == _TYPE_NS or rtype == _TYPE_TXT:
+    elif (
+        rtype == _TYPE_CNAME
+        or rtype == _TYPE_NS
+        or rtype == _TYPE_SOA
+        or rtype == _TYPE_TXT
+    ):
         expected_rdlength = None
     else:
         raise DNSMessageError(
             "unsupported record type: %d"
-            " (only A, AAAA, CNAME, NS and TXT are supported)" % rtype
+            " (only A, AAAA, CNAME, NS, SOA and TXT are supported)" % rtype
         )
 
     rdata_end = fixed_end + rdlength
@@ -753,6 +842,45 @@ def decode_resource_record(message, offset=0):
             "class": rclass,
             "ttl": ttl,
             "target": target,
+        }, rdata_end
+
+    if rtype == _TYPE_SOA:
+        if rdlength == 0:
+            raise DNSMessageError("SOA record RDLENGTH must not be zero")
+        if rdata_end > len(message):
+            raise DNSMessageError("truncated RDATA")
+        # The declared region holds mname, rname and exactly five
+        # network-order 32-bit integers in that order; each name's raw
+        # encoding (a compression pointer included) must stay inside it.
+        mname, mname_end = decode_name(message, fixed_end)
+        if mname_end >= rdata_end:
+            raise DNSMessageError(
+                "SOA RDATA must contain mname, rname and exactly five"
+                " 32-bit unsigned integers"
+            )
+        rname, rname_end = decode_name(message, mname_end)
+        if rname_end > rdata_end:
+            raise DNSMessageError("SOA rname extends beyond the declared RDATA")
+        if rname_end + _SOA_TIMERS_LENGTH != rdata_end:
+            raise DNSMessageError(
+                "SOA RDATA must contain mname, rname and exactly five"
+                " 32-bit unsigned integers"
+            )
+        serial, refresh, retry, expire, minimum = _SOA_TIMERS_STRUCT.unpack(
+            message[rname_end:rdata_end]
+        )
+        return {
+            "name": name,
+            "type": rtype,
+            "class": rclass,
+            "ttl": ttl,
+            "mname": mname,
+            "rname": rname,
+            "serial": serial,
+            "refresh": refresh,
+            "retry": retry,
+            "expire": expire,
+            "minimum": minimum,
         }, rdata_end
 
     if rdlength != expected_rdlength:
@@ -861,8 +989,8 @@ def decode_message(data):
     answers, authorities, additionals; each entry keeps the key order of
     decode_header, decode_question and decode_resource_record. The header
     is read first, then exactly qdcount questions and ancount, nscount
-    and arcount resource records (A, AAAA, CNAME, NS and TXT only) are
-    read
+    and arcount resource records (A, AAAA, CNAME, NS, SOA and TXT only)
+    are read
     from the same bytes; names may use the legal backward compression
     pointers accepted by decode_name. Raises DNSArgumentError when
     ``data`` is not bytes or exceeds 65535 bytes, and DNSMessageError
@@ -1106,11 +1234,11 @@ def main(argv=None):
     )
     subparsers.add_parser(
         "encode-record",
-        help="read a UTF-8 JSON A/AAAA/CNAME/NS/TXT record object from stdin and print its hex wire form",
+        help="read a UTF-8 JSON A/AAAA/CNAME/NS/SOA/TXT record object from stdin and print its hex wire form",
     )
     subparsers.add_parser(
         "decode-record",
-        help="read hexadecimal wire bytes from stdin and print the A/AAAA/CNAME/NS/TXT record as JSON",
+        help="read hexadecimal wire bytes from stdin and print the A/AAAA/CNAME/NS/SOA/TXT record as JSON",
     )
     subparsers.add_parser(
         "encode-message",

@@ -20,8 +20,8 @@ DNS 问题报文与资源记录的编解码、压缩指针与 DNAME 语义。
 * `encode_name(name)` / `decode_name(message, offset=0)`：绝对域名编解码，解码支持受限的向后压缩指针。
 * `encode_question(question)`：把只含 `name`、`qtype`、`qclass` 的映射编码为未压缩名称加两个网络字节序 16 位值；缺字段、未知字段、类型错误或数值越界抛出 `DNSArgumentError`，校验完成前不返回结果且不修改输入。
 * `decode_question(message, offset=0)`：从完整 DNS 消息的指定偏移读取一个问题，返回 `({"name", "qtype", "qclass"}, next_offset)`，键序固定；参数或偏移非法抛出 `DNSArgumentError`，名称畸形或末尾不足四字节抛出 `DNSMessageError`。
-* `encode_resource_record(record)`：把只含 `name`、`type`、`class`、`ttl`、`address` 的映射（键序不限）编码为一条 A 资源记录；名称以未压缩形式写入，`type` 只接受整数 1，`class` 为 16 位、`ttl` 为 32 位无符号整数（布尔值不被接受），`address` 为无前导零的四段点分十进制 IPv4 字符串，RDLENGTH 固定为 4；任何形状、类型、范围或取值非法抛出 `DNSArgumentError`，校验完成前不返回结果且不修改输入。
-* `decode_resource_record(message, offset=0)`：从完整消息的指定偏移读取一条 A 记录，返回 `({"name", "type", "class", "ttl", "address"}, next_offset)`，键序固定，地址为规范点分十进制；参数、超过 65535 字节的消息或越界偏移抛出 `DNSArgumentError`，名称畸形、固定字段或 RDATA 截断、RDLENGTH 不为 4、非 A 类型抛出 `DNSMessageError`，失败时不返回部分结果。
+* `encode_resource_record(record)`：把只含 `name`、`type`、`class`、`ttl`、`address` 的映射（键序不限）编码为一条 A 或 AAAA 资源记录；名称以未压缩形式写入，`type` 只接受整数 1（A）或 28（AAAA），`class` 为 16 位、`ttl` 为 32 位无符号整数（布尔值不被接受）；type 为 1 时 `address` 为无前导零的四段点分十进制 IPv4 字符串，RDLENGTH 固定为 4；type 为 28 时 `address` 为合法 IPv6 文本（不含首尾空白、区域标识与前缀长度，允许十六进制大小写、前导零、`::` 压缩与末尾 IPv4 嵌入写法），RDLENGTH 固定为 16，RDATA 为 128 位网络字节序，同一地址的不同合法写法产生相同字节；任何形状、类型、范围或取值非法（含 type 与地址族不匹配）抛出 `DNSArgumentError`，校验完成前不返回结果且不修改输入。
+* `decode_resource_record(message, offset=0)`：从完整消息的指定偏移读取一条 A 或 AAAA 记录，返回 `({"name", "type", "class", "ttl", "address"}, next_offset)`，键序固定；A 地址为规范点分十进制，AAAA 地址为规范 IPv6 文本（小写十六进制、各段无前导零、只压缩长度至少为两段的最长连续零段、并列取最左，IPv4 嵌入地址同样输出十六进制形式）；参数、超过 65535 字节的消息或越界偏移抛出 `DNSArgumentError`，名称畸形、固定字段或 RDATA 截断、A 的 RDLENGTH 不为 4、AAAA 的 RDLENGTH 不为 16、其他类型抛出 `DNSMessageError`，失败时不返回部分结果。
 * 异常：`DNSArgumentError`、`DNSMessageError`。
 * 头部计数不会被问题编解码读取或修改。
 

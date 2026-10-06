@@ -25,7 +25,8 @@ QTYPE and QCLASS unsigned 16-bit values in network byte order.
 
 A resource record (RFC 1035 section 4.1.3) is a domain name followed by
 TYPE, CLASS, TTL, RDLENGTH and RDATA; only A records (TYPE 1, four-octet
-IPv4 RDATA) are supported here.
+IPv4 RDATA) and AAAA records (TYPE 28, sixteen-octet IPv6 RDATA, RFC 3596)
+are supported here.
 
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
@@ -77,8 +78,11 @@ _4BIT_FIELDS = frozenset(("opcode", "rcode"))
 _HEADER_STRUCT = struct.Struct("!HBBHHHH")
 _QUESTION_STRUCT = struct.Struct("!HH")
 _RECORD_FIXED_STRUCT = struct.Struct("!HHIH")
+_AAAA_STRUCT = struct.Struct("!8H")
 _TYPE_A = 1
+_TYPE_AAAA = 28
 _A_RDATA_LENGTH = 4
+_AAAA_RDATA_LENGTH = 16
 HEADER_SIZE = 12
 _INPUT_LIMIT = 4096
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -409,16 +413,107 @@ def _parse_ipv4(address):
     return octets
 
 
+def _parse_ipv6_groups(tokens, allow_ipv4_last):
+    # Each token is one to four hex digits; the final token of the whole
+    # address may instead be a dotted-decimal IPv4 part (two groups).
+    values = []
+    for index, text in enumerate(tokens):
+        if "." in text:
+            if not allow_ipv4_last or index != len(tokens) - 1:
+                raise DNSArgumentError(
+                    "field 'address' IPv4 part must be the last group"
+                )
+            octets = _parse_ipv4(text)
+            values.append((octets[0] << 8) | octets[1])
+            values.append((octets[2] << 8) | octets[3])
+            continue
+        if not 1 <= len(text) <= 4 or any(ch not in _HEX_DIGITS for ch in text):
+            raise DNSArgumentError(
+                "field 'address' has an invalid group: %r" % text
+            )
+        values.append(int(text, 16))
+    return values
+
+
+def _parse_ipv6(address):
+    # Strict textual form: no surrounding whitespace, no zone identifier,
+    # no prefix length; hexadecimal groups in either case, at most one
+    # "::" compression and an optional trailing IPv4-embedded part.
+    if not isinstance(address, str):
+        raise DNSArgumentError("field 'address' must be a string")
+    if not address or not address.isascii():
+        raise DNSArgumentError("field 'address' must be non-empty ASCII")
+    if any(ch.isspace() for ch in address):
+        raise DNSArgumentError("field 'address' must not contain whitespace")
+    if "%" in address:
+        raise DNSArgumentError("field 'address' must not contain a zone identifier")
+    if "/" in address:
+        raise DNSArgumentError("field 'address' must not contain a prefix length")
+    if address.count("::") > 1:
+        raise DNSArgumentError("field 'address' has more than one '::'")
+
+    if "::" in address:
+        left, right = address.split("::")
+        left_tokens = left.split(":") if left else []
+        right_tokens = right.split(":") if right else []
+        # The IPv4-embedded part belongs at the very end of the address,
+        # which is never inside the left half of a compressed form.
+        left_values = _parse_ipv6_groups(left_tokens, allow_ipv4_last=False)
+        right_values = _parse_ipv6_groups(right_tokens, allow_ipv4_last=True)
+        missing = 8 - len(left_values) - len(right_values)
+        if missing < 1:
+            raise DNSArgumentError(
+                "field 'address' has too many groups for '::' compression"
+            )
+        values = left_values + [0] * missing + right_values
+    else:
+        values = _parse_ipv6_groups(address.split(":"), allow_ipv4_last=True)
+        if len(values) != 8:
+            raise DNSArgumentError("field 'address' must have eight groups")
+
+    return struct.pack("!8H", *values)
+
+
+def _format_ipv6(groups):
+    # Canonical form: lowercase hex without leading zeros; the longest run
+    # of at least two zero groups is compressed (leftmost run on a tie).
+    best_start = -1
+    best_length = 0
+    index = 0
+    while index < len(groups):
+        if groups[index] != 0:
+            index += 1
+            continue
+        end = index
+        while end < len(groups) and groups[end] == 0:
+            end += 1
+        if end - index > best_length:
+            best_start = index
+            best_length = end - index
+        index = end
+
+    if best_length < 2:
+        return ":".join(format(group, "x") for group in groups)
+    left = ":".join(format(group, "x") for group in groups[:best_start])
+    right = ":".join(format(group, "x") for group in groups[best_start + best_length:])
+    return left + "::" + right
+
+
 def encode_resource_record(record):
-    """Encode one A resource record mapping into wire bytes.
+    """Encode one A or AAAA resource record mapping into wire bytes.
 
     The mapping must contain exactly the keys name, type, class, ttl and
     address (in any order). The name is written uncompressed; ``type`` must
-    be the integer 1 (A), ``class`` a 16-bit and ``ttl`` a 32-bit unsigned
-    integer (bools are never accepted), and ``address`` a dotted-decimal
-    IPv4 string without leading zeros. RDLENGTH is fixed to 4. Validation
-    is completed before any result is produced; the caller's object is
-    never mutated. Raises DNSArgumentError for any invalid input.
+    be the integer 1 (A) or 28 (AAAA), ``class`` a 16-bit and ``ttl`` a
+    32-bit unsigned integer (bools are never accepted), and ``address`` a
+    dotted-decimal IPv4 string without leading zeros for type 1 or an
+    IPv6 text form for type 28 (either hex case, leading zeros, "::"
+    compression and IPv4-embedded forms accepted; no whitespace, zone
+    identifier or prefix length). RDLENGTH is fixed to 4 or 16 and RDATA
+    is the address in network byte order, so different legal spellings of
+    the same address produce identical bytes. Validation is completed
+    before any result is produced; the caller's object is never mutated.
+    Raises DNSArgumentError for any invalid input.
     """
     if not isinstance(record, Mapping):
         raise DNSArgumentError("record must be a mapping")
@@ -440,31 +535,38 @@ def encode_resource_record(record):
     # Validate all inputs before producing any output.
     encoded_name = encode_name(name)
     _check_uint(rtype, "type", 16)
-    if rtype != _TYPE_A:
-        raise DNSArgumentError("field 'type' must be 1 (A)")
+    if rtype == _TYPE_A:
+        rdata = bytes(_parse_ipv4(address))
+    elif rtype == _TYPE_AAAA:
+        rdata = _parse_ipv6(address)
+    else:
+        raise DNSArgumentError("field 'type' must be 1 (A) or 28 (AAAA)")
     _check_uint(rclass, "class", 16)
     _check_uint(ttl, "ttl", 32)
-    octets = _parse_ipv4(address)
 
     return (
         encoded_name
-        + _RECORD_FIXED_STRUCT.pack(rtype, rclass, ttl, _A_RDATA_LENGTH)
-        + bytes(octets)
+        + _RECORD_FIXED_STRUCT.pack(rtype, rclass, ttl, len(rdata))
+        + rdata
     )
 
 
 def decode_resource_record(message, offset=0):
-    """Read one A resource record from ``message`` starting at ``offset``.
+    """Read one A or AAAA resource record from ``message`` starting at ``offset``.
 
     Returns a ``(record, next_offset)`` tuple: ``record`` is a plain dict
     with keys in the fixed order name, type, class, ttl, address, and
     ``next_offset`` is the first byte after the record in the original
     message. The owner name follows the same compression-pointer rules as
-    decode_name; the address is rendered in canonical dotted decimal
-    without leading zeros. Raises DNSArgumentError for invalid arguments
-    and DNSMessageError for malformed wire data (truncated name, fixed
-    fields or RDATA, a non-A TYPE, or an RDLENGTH other than 4); no
-    partial result is returned on failure.
+    decode_name; an A address is rendered in canonical dotted decimal
+    without leading zeros, an AAAA address in canonical IPv6 text form
+    (lowercase hex, no leading zeros, the longest run of at least two zero
+    groups compressed, leftmost run on a tie; IPv4-embedded addresses are
+    rendered in the same hexadecimal form). Raises DNSArgumentError for
+    invalid arguments and DNSMessageError for malformed wire data
+    (truncated name, fixed fields or RDATA, a TYPE other than A or AAAA,
+    or an RDLENGTH other than 4 for A or 16 for AAAA); no partial result
+    is returned on failure.
     """
     if not isinstance(message, bytes):
         raise DNSArgumentError("message must be bytes")
@@ -489,18 +591,28 @@ def decode_resource_record(message, offset=0):
         message[position:fixed_end]
     )
 
-    if rtype != _TYPE_A:
-        raise DNSMessageError("unsupported record type: %d (only A is supported)" % rtype)
-    if rdlength != _A_RDATA_LENGTH:
+    if rtype == _TYPE_A:
+        expected_rdlength = _A_RDATA_LENGTH
+    elif rtype == _TYPE_AAAA:
+        expected_rdlength = _AAAA_RDATA_LENGTH
+    else:
         raise DNSMessageError(
-            "A record RDLENGTH must be %d, got %d" % (_A_RDATA_LENGTH, rdlength)
+            "unsupported record type: %d (only A and AAAA are supported)" % rtype
+        )
+    if rdlength != expected_rdlength:
+        raise DNSMessageError(
+            "%s record RDLENGTH must be %d, got %d"
+            % ("A" if rtype == _TYPE_A else "AAAA", expected_rdlength, rdlength)
         )
 
     rdata_end = fixed_end + rdlength
     if rdata_end > len(message):
         raise DNSMessageError("truncated RDATA")
 
-    address = ".".join(str(octet) for octet in message[fixed_end:rdata_end])
+    if rtype == _TYPE_A:
+        address = ".".join(str(octet) for octet in message[fixed_end:rdata_end])
+    else:
+        address = _format_ipv6(_AAAA_STRUCT.unpack(message[fixed_end:rdata_end]))
 
     return {
         "name": name,
@@ -668,11 +780,11 @@ def main(argv=None):
     )
     subparsers.add_parser(
         "encode-record",
-        help="read a UTF-8 JSON A record object from stdin and print its hex wire form",
+        help="read a UTF-8 JSON A/AAAA record object from stdin and print its hex wire form",
     )
     subparsers.add_parser(
         "decode-record",
-        help="read hexadecimal wire bytes from stdin and print the A record as JSON",
+        help="read hexadecimal wire bytes from stdin and print the A/AAAA record as JSON",
     )
     args = parser.parse_args(argv)
 

@@ -94,12 +94,22 @@ label with ASCII case folding) before consulting the response TC flag
 and the transport. No clock or network is read and no hidden state is
 kept.
 
+extract_nxdomain_cache turns an authoritative NXDOMAIN response into a
+negative cache entry: after the same full validation and correlation of
+the query and the response it requires an untruncated response with
+rcode 3, an empty answer section and an SOA of the question's class
+whose owner name is a label ancestor of the question name; the entry
+covers every qtype at that name and class and its ttl is the smaller
+of the SOA ttl and minimum. No clock or network is read and no hidden
+state is kept.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
 synthesize_dname_cname, age_cached_records, lookup_cache,
 lookup_cache_chain, update_cache,
 select_referral, plan_truncation_retry, plan_response_acceptance,
+extract_nxdomain_cache,
 DNSArgumentError, DNSMessageError.
 """
 
@@ -128,6 +138,7 @@ __all__ = [
     "select_referral",
     "plan_truncation_retry",
     "plan_response_acceptance",
+    "extract_nxdomain_cache",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -2083,6 +2094,121 @@ def plan_response_acceptance(query, response, transport):
     return result
 
 
+_NXDOMAIN_RCODE = 3
+
+
+def extract_nxdomain_cache(query, response):
+    """Turn an authoritative NXDOMAIN response into a negative cache entry.
+
+    ``query`` and ``response`` are full message mappings following the
+    encode_message rules (exactly the keys header, questions, answers,
+    authorities and additionals, with the header counts matching their
+    sections and every question and record valid); the query header's
+    ``qr`` must be False, the response header's ``qr`` must be True and
+    each message must carry exactly one question. Both messages are
+    fully validated -- every section, count and record -- before any
+    decision is made and the inputs (TXT containers included) are never
+    mutated. No clock or network is read and no hidden state is kept, so
+    identical inputs produce identical results.
+
+    The header ``id`` and ``opcode`` and the question ``name``,
+    ``qtype`` and ``qclass`` are correlated, the name label by label
+    with ASCII case-insensitive matching; when any of them differs the
+    result is "unmatched" with ``entry`` None. When they match and the
+    response ``tc`` is True, its answer section is non-empty, or the
+    authority section holds no SOA of the question's class whose owner
+    name is a label ancestor of the question name (the question name
+    itself included), the result is "not-cacheable" with ``entry``
+    None. A correlated, untruncated response with an empty answer
+    section whose ``rcode`` is not 3 is then reported as
+    "not-nxdomain" with ``entry`` None regardless of its authority
+    section. Otherwise the response is an NXDOMAIN indication: among the qualifying SOA records the one with the
+    deepest owner name is chosen (the first such record in authority
+    order on a depth tie) and the result is "cacheable" with an
+    ``entry`` mapping in the fixed key order name, class, ttl: the
+    query question's name with its original case, the question's
+    class, and the smaller of the chosen SOA's ``ttl`` and
+    ``minimum``. The entry states that the name does not exist for
+    every qtype in that class; a zero ttl is returned as-is and the
+    existing aging semantics decide its immediate expiry. Raises
+    DNSArgumentError for any invalid input; validation failures never
+    degrade into an "unmatched" result.
+    """
+    # Validate both messages completely -- every section, count and
+    # record -- before any role or correlation check; encode_message
+    # performs the full validation without mutating its argument and
+    # its wire result is discarded here.
+    encode_message(query)
+    encode_message(response)
+
+    query_header = query["header"]
+    response_header = response["header"]
+    if query_header["qr"] is not False:
+        raise DNSArgumentError("query header field 'qr' must be false")
+    if response_header["qr"] is not True:
+        raise DNSArgumentError("response header field 'qr' must be true")
+
+    if len(query["questions"]) != 1:
+        raise DNSArgumentError("query must contain exactly one question")
+    if len(response["questions"]) != 1:
+        raise DNSArgumentError("response must contain exactly one question")
+
+    result = {"status": None, "entry": None}
+
+    query_question = query["questions"][0]
+    response_question = response["questions"][0]
+    query_labels = [label.lower() for label in _split_labels(query_question["name"])]
+    response_labels = [
+        label.lower() for label in _split_labels(response_question["name"])
+    ]
+    if (
+        query_header["id"] != response_header["id"]
+        or query_header["opcode"] != response_header["opcode"]
+        or query_question["qtype"] != response_question["qtype"]
+        or query_question["qclass"] != response_question["qclass"]
+        or query_labels != response_labels
+    ):
+        result["status"] = "unmatched"
+        return result
+
+    # Correlated: truncation and a non-empty answer section defeat
+    # negative caching before the rcode is consulted.
+    if response_header["tc"] or response["answers"]:
+        result["status"] = "not-cacheable"
+        return result
+
+    if response_header["rcode"] != _NXDOMAIN_RCODE:
+        result["status"] = "not-nxdomain"
+        return result
+
+    # The deepest qualifying SOA owner wins; same depth keeps the
+    # first SOA in authority section order.
+    chosen = None
+    chosen_depth = -1
+    for record in response["authorities"]:
+        if record["type"] != _TYPE_SOA or record["class"] != query_question["qclass"]:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(record["name"])]
+        if not _labels_at_or_below(query_labels, owner_labels):
+            continue
+        depth = len(owner_labels)
+        if depth > chosen_depth:
+            chosen = record
+            chosen_depth = depth
+
+    if chosen is None:
+        result["status"] = "not-cacheable"
+        return result
+
+    result["status"] = "cacheable"
+    result["entry"] = {
+        "name": query_question["name"],
+        "class": query_question["qclass"],
+        "ttl": min(chosen["ttl"], chosen["minimum"]),
+    }
+    return result
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -2429,6 +2555,24 @@ def _cmd_plan_response_acceptance():
     return 0
 
 
+_EXTRACT_NXDOMAIN_FIELDS = ("query", "response")
+_EXTRACT_NXDOMAIN_FIELD_SET = frozenset(_EXTRACT_NXDOMAIN_FIELDS)
+
+
+def _cmd_extract_nxdomain_cache():
+    obj = _read_json_object()
+    for field_name in _EXTRACT_NXDOMAIN_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _EXTRACT_NXDOMAIN_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = extract_nxdomain_cache(obj["query"], obj["response"])
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -2498,6 +2642,10 @@ def main(argv=None):
         "plan-response-acceptance",
         help="read a UTF-8 JSON object with query, response and transport from stdin and print the response acceptance decision as JSON",
     )
+    subparsers.add_parser(
+        "extract-nxdomain-cache",
+        help="read a UTF-8 JSON object with query and response from stdin and print the NXDOMAIN negative cache decision as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -2531,6 +2679,8 @@ def main(argv=None):
             return _cmd_select_referral()
         if args.command == "plan-truncation-retry":
             return _cmd_plan_truncation_retry()
+        if args.command == "extract-nxdomain-cache":
+            return _cmd_extract_nxdomain_cache()
         return _cmd_plan_response_acceptance()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)

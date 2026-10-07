@@ -70,11 +70,20 @@ the query name becomes the delegation cut and the matching in-bailiwick
 A and AAAA records become the glue, with names compared label by label
 using ASCII case folding.
 
+plan_truncation_retry turns the TC flag of one response header into a
+transport retry decision: given the query header, the response header
+and the transport of the current exchange it decides deterministically
+whether the response is accepted, the query is retried over TCP, the
+response does not belong to the query, or truncation persists over TCP
+and automatic retries stop. Only the two fixed-size headers and the
+transport name are consulted; no body, clock or network is read.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
 synthesize_dname_cname, age_cached_records, lookup_cache, update_cache,
-select_referral, DNSArgumentError, DNSMessageError.
+select_referral, plan_truncation_retry, DNSArgumentError,
+DNSMessageError.
 """
 
 import argparse
@@ -99,6 +108,7 @@ __all__ = [
     "lookup_cache",
     "update_cache",
     "select_referral",
+    "plan_truncation_retry",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -1768,6 +1778,71 @@ def select_referral(qname, qclass, authorities, additionals):
     }
 
 
+_TRANSPORTS = frozenset(("udp", "tcp"))
+
+
+def plan_truncation_retry(query_header, response_header, transport):
+    """Decide whether a truncated response triggers a retry over TCP.
+
+    ``query_header`` and ``response_header`` are header mappings
+    following the encode_header rules (exactly the HEADER_FIELDS keys
+    with their usual types and ranges); the query header's ``qr`` must
+    be False and the response header's ``qr`` must be True.
+    ``transport`` is the string "udp" or "tcp", the transport of the
+    exchange that produced ``response_header``. Both headers are fully
+    validated before any result is produced and the inputs are never
+    mutated. Only the two fixed-size headers and the transport name are
+    consulted: no message body, clock or network is read and no hidden
+    state is kept, so identical inputs produce identical results.
+
+    Returns a new mapping with the fixed key order status,
+    next_transport: when the two headers differ in ``id`` or ``opcode``
+    the response does not belong to the query and the result is
+    "unmatched" with ``next_transport`` None; when they match and the
+    response ``tc`` is False the response is usable as-is and the
+    result is "accept" with ``next_transport`` None, regardless of the
+    transport and ``rcode``; when they match, ``tc`` is True and
+    ``transport`` is "udp" the result is "retry" with ``next_transport``
+    "tcp"; when the same truncation flag arrives over "tcp" the result
+    is "truncated" with ``next_transport`` None, ending automatic
+    retries. Raises DNSArgumentError for any invalid input.
+    """
+    # Validate both headers completely before any role or transport
+    # check; encode_header performs the full field validation without
+    # mutating its argument and its wire result is discarded here.
+    encode_header(query_header)
+    encode_header(response_header)
+
+    if not isinstance(transport, str) or transport not in _TRANSPORTS:
+        raise DNSArgumentError("transport must be 'udp' or 'tcp'")
+
+    if query_header["qr"] is not False:
+        raise DNSArgumentError("query header field 'qr' must be false")
+    if response_header["qr"] is not True:
+        raise DNSArgumentError("response header field 'qr' must be true")
+
+    result = {"status": None, "next_transport": None}
+
+    if (
+        query_header["id"] != response_header["id"]
+        or query_header["opcode"] != response_header["opcode"]
+    ):
+        result["status"] = "unmatched"
+        return result
+
+    if not response_header["tc"]:
+        result["status"] = "accept"
+        return result
+
+    if transport == "udp":
+        result["status"] = "retry"
+        result["next_transport"] = "tcp"
+        return result
+
+    result["status"] = "truncated"
+    return result
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -2045,6 +2120,28 @@ def _cmd_select_referral():
     return 0
 
 
+_PLAN_TRUNCATION_FIELDS = ("query_header", "response_header", "transport")
+_PLAN_TRUNCATION_FIELD_SET = frozenset(_PLAN_TRUNCATION_FIELDS)
+
+
+def _cmd_plan_truncation_retry():
+    obj = _read_json_object()
+    for field_name in _PLAN_TRUNCATION_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _PLAN_TRUNCATION_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = plan_truncation_retry(
+        obj["query_header"],
+        obj["response_header"],
+        obj["transport"],
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -2102,6 +2199,10 @@ def main(argv=None):
         "select-referral",
         help="read a UTF-8 JSON object with qname, qclass, authorities and additionals from stdin and print the referral selection as JSON",
     )
+    subparsers.add_parser(
+        "plan-truncation-retry",
+        help="read a UTF-8 JSON object with query_header, response_header and transport from stdin and print the truncation retry decision as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -2129,7 +2230,9 @@ def main(argv=None):
             return _cmd_lookup_cache()
         if args.command == "update-cache":
             return _cmd_update_cache()
-        return _cmd_select_referral()
+        if args.command == "select-referral":
+            return _cmd_select_referral()
+        return _cmd_plan_truncation_retry()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

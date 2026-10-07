@@ -40,10 +40,15 @@ question, answer, authority and additional sections; encode_message and
 decode_message convert between the wire form and a mapping with the keys
 header, questions, answers, authorities and additionals.
 
+synthesize_dname_cname (RFC 6672 section 3) is the standalone DNAME
+CNAME synthesis entry point: given a query name, a DNAME record mapping
+and the delegation cuts between them, it decides whether a CNAME may be
+synthesized and builds it without ever mutating its inputs.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
-DNSArgumentError, DNSMessageError.
+synthesize_dname_cname, DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -63,6 +68,7 @@ __all__ = [
     "decode_resource_record",
     "encode_message",
     "decode_message",
+    "synthesize_dname_cname",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -135,6 +141,7 @@ MAX_LABEL_LENGTH = 63
 MAX_NAME_LENGTH = 255
 MAX_MESSAGE_LENGTH = 65535
 MAX_COMPRESSION_POINTERS = 128
+MAX_DELEGATION_CUTS = 128
 _POINTER_BITS = 0xC0
 
 
@@ -1059,6 +1066,111 @@ def decode_message(data):
     }
 
 
+_DNAME_FIELD_SET = frozenset(DNAME_RECORD_FIELDS)
+
+
+def _split_labels(name):
+    # ``name`` is a validated absolute name; the root (".") yields no labels.
+    body = name[:-1]
+    return body.split(".") if body else []
+
+
+def synthesize_dname_cname(qname, dname, delegation_cuts):
+    """Synthesize the CNAME record implied by a DNAME record (RFC 6672).
+
+    ``qname`` is the query name as an absolute ASCII domain name,
+    ``dname`` a mapping with exactly the keys name, type, class, ttl and
+    target of a DNAME record (``type`` must be the integer 39) and
+    ``delegation_cuts`` a sequence of at most 128 absolute ASCII domain
+    names. Names are matched label by label with ASCII case-insensitive
+    comparison, never as plain string suffixes. Returns a mapping with
+    the fixed key order status, cname: ``status`` is "synthesized" when
+    ``qname`` lies strictly below the DNAME owner name and no delegation
+    cut lies on the label path from the owner name to ``qname`` (both
+    endpoints included), "name-too-long" when synthesis applies but the
+    synthesized target would exceed 255 wire bytes, and "not-applicable"
+    otherwise (``qname`` equal to the owner name or on a different
+    branch, or a delegation cut on the path). Only "synthesized" comes
+    with a ``cname`` mapping (fixed key order name, type, class, ttl,
+    target: the original ``qname``, the integer 5, and the class, ttl
+    and target of the DNAME record with the ``qname`` prefix labels
+    substituted for the owner name, each side keeping its original
+    case); the other statuses map ``cname`` to None. All validation is
+    completed before any result is produced and the inputs are never
+    mutated. Raises DNSArgumentError for any invalid input.
+    """
+    # Validate everything before producing any result.
+    encode_name(qname)
+
+    if not isinstance(dname, Mapping):
+        raise DNSArgumentError("dname must be a mapping")
+    for field_name in DNAME_RECORD_FIELDS:
+        if field_name not in dname:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in dname:
+        if key not in _DNAME_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    encode_name(dname["name"])
+    rtype = dname["type"]
+    _check_uint(rtype, "type", 16)
+    if rtype != _TYPE_DNAME:
+        raise DNSArgumentError("field 'type' must be 39 (DNAME)")
+    _check_uint(dname["class"], "class", 16)
+    _check_uint(dname["ttl"], "ttl", 32)
+    encode_name(dname["target"])
+
+    if not isinstance(delegation_cuts, (list, tuple)):
+        raise DNSArgumentError("delegation_cuts must be a sequence")
+    if len(delegation_cuts) > MAX_DELEGATION_CUTS:
+        raise DNSArgumentError(
+            "delegation_cuts exceeds %d entries" % MAX_DELEGATION_CUTS
+        )
+    cut_labels = []
+    for cut in delegation_cuts:
+        encode_name(cut)
+        cut_labels.append([label.lower() for label in _split_labels(cut)])
+
+    qname_labels = _split_labels(qname)
+    owner_labels = _split_labels(dname["name"])
+    target_labels = _split_labels(dname["target"])
+    lower_qname = [label.lower() for label in qname_labels]
+    lower_owner = [label.lower() for label in owner_labels]
+
+    result = {"status": "not-applicable", "cname": None}
+
+    prefix_length = len(qname_labels) - len(owner_labels)
+    if prefix_length <= 0 or lower_qname[prefix_length:] != lower_owner:
+        # qname is the owner name itself or belongs to another branch.
+        return result
+
+    # A cut on the label path from the owner name to qname (endpoints
+    # included) is a suffix of qname of len(owner)..len(qname) labels.
+    for cut in cut_labels:
+        depth = len(cut)
+        if len(owner_labels) <= depth <= len(qname_labels) and cut == lower_qname[
+            len(qname_labels) - depth :
+        ]:
+            return result
+
+    synthesized = qname_labels[:prefix_length] + target_labels
+    wire_length = 1  # the terminating zero length octet
+    for label in synthesized:
+        wire_length += 1 + len(label.encode("ascii"))
+    if wire_length > MAX_NAME_LENGTH:
+        result["status"] = "name-too-long"
+        return result
+
+    result["status"] = "synthesized"
+    result["cname"] = {
+        "name": qname,
+        "type": _TYPE_CNAME,
+        "class": dname["class"],
+        "ttl": dname["ttl"],
+        "target": ".".join(synthesized) + ".",
+    }
+    return result
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -1227,6 +1339,26 @@ def _cmd_decode_message():
     return 0
 
 
+_SYNTHESIZE_FIELDS = ("qname", "dname", "delegation_cuts")
+_SYNTHESIZE_FIELD_SET = frozenset(_SYNTHESIZE_FIELDS)
+
+
+def _cmd_synthesize_dname():
+    obj = _read_json_object()
+    for field_name in _SYNTHESIZE_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _SYNTHESIZE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = synthesize_dname_cname(
+        obj["qname"], obj["dname"], obj["delegation_cuts"]
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -1264,6 +1396,10 @@ def main(argv=None):
         "decode-message",
         help="read hexadecimal wire bytes from stdin and print the full message as JSON",
     )
+    subparsers.add_parser(
+        "synthesize-dname",
+        help="read a UTF-8 JSON object with qname, dname and delegation_cuts from stdin and print the synthesis result as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1281,7 +1417,9 @@ def main(argv=None):
             return _cmd_decode_record()
         if args.command == "encode-message":
             return _cmd_encode_message()
-        return _cmd_decode_message()
+        if args.command == "decode-message":
+            return _cmd_decode_message()
+        return _cmd_synthesize_dname()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

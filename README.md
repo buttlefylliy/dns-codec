@@ -27,6 +27,7 @@ DNS 问题报文与资源记录的编解码、压缩指针与 DNAME 语义。
 * `synthesize_dname_cname(qname, dname, delegation_cuts)`：独立的 DNAME CNAME 合成功能（RFC 6672），不影响既有编解码入口。`qname` 为绝对 ASCII 查询名，`dname` 为只含 `name`、`type`、`class`、`ttl`、`target` 的 DNAME 记录映射（`type` 必须为整数 39），`delegation_cuts` 为至多 128 个绝对 ASCII 域名的序列。名称按 DNS 标签逐项做 ASCII 大小写不敏感比较，不做普通字符串后缀匹配。返回键序固定为 `status`、`cname` 的映射：`status` 为 `synthesized`（`qname` 严格位于 DNAME 所有者名之下，且从所有者名到 `qname` 的标签路径上含端点均无委派切口）、`name-too-long`（可合成但合成目标的 DNS 线格式名称超过 255 字节，不返回部分记录）或 `not-applicable`（`qname` 等于所有者名、属于其他分支，或路径上存在委派切口）；仅 `synthesized` 时 `cname` 为键序固定 `name`、`type`、`class`、`ttl`、`target` 的映射（`name` 为原 `qname`，`type` 为 5，`class`、`ttl` 来自 DNAME，`target` 为 `qname` 前缀标签拼接 DNAME 目标名，前缀保留 `qname` 大小写、目标部分保留 `target` 大小写），其余状态 `cname` 为 `None`。先完成全部校验再产生结果，不修改输入；`qname`、`dname` 字段或 `delegation_cuts` 的形状、类型、绝对域名规则、数值范围不合法，或切口超过 128 项，均抛出 `DNSArgumentError`。
 * 异常：`DNSArgumentError`、`DNSMessageError`。
 * 头部计数不会被问题编解码读取或修改。
+* `age_cached_records(records, stored_at, now)`：无隐藏状态的缓存快照老化入口，不读取系统时间。`records` 为至多 128 条现有支持类型（A、AAAA、CNAME、NS、DNAME、SOA、TXT）资源记录映射组成的 list 或 tuple，`stored_at` 与 `now` 为以秒为单位的非负 64 位整数（不接受布尔值），`now` 小于 `stored_at` 时抛出 `DNSArgumentError`。老化前完整校验所有记录均符合 `encode_resource_record` 的公开规则，随后以 `now - stored_at` 为统一经过时间：原 TTL 大于经过时间的记录按输入顺序保留并把 TTL 替换为两者之差，原 TTL 小于或等于经过时间的记录过期（TTL 为零的记录即使 `now` 等于 `stored_at` 也会过期）。返回键序固定为 `records`、`expired` 的新建映射：`records` 中每条记录使用其类型对应的既有固定键序，除 TTL 外的字段值保持不变，`expired` 为被删除的记录数；不修改输入记录或容器，相同输入产生逐字段一致的结果。
 
 ### 命令行
 
@@ -38,6 +39,7 @@ DNS 问题报文与资源记录的编解码、压缩指针与 DNAME 语义。
 * `encode-message`：从标准输入读取 UTF-8 JSON 对象（仅含 `header`、`questions`、`answers`、`authorities`、`additionals`），输出仅含 `wire` 的紧凑 JSON。
 * `decode-message`：读取十六进制完整报文，输出键序固定为 `header`、`questions`、`answers`、`authorities`、`additionals` 的紧凑 JSON；截断、畸形、不支持的记录类型或尾随字节均按 message 错误处理（退出码 3）。
 * `synthesize-dname`：从标准输入读取仅含 `qname`、`dname`、`delegation_cuts` 的 UTF-8 JSON 对象，输出键序固定为 `status`、`cname` 的单行紧凑 JSON（`status` 为 `synthesized`、`not-applicable` 或 `name-too-long`，仅 `synthesized` 时 `cname` 非 `null`）；缺字段、未知字段或任何参数非法均按 argument 错误处理（退出码 2）。
+* `age-cache`：从标准输入读取仅含 `records`、`stored_at`、`now` 的 UTF-8 JSON 对象，输出键序固定为 `records`、`expired` 的单行紧凑 JSON，记录顺序与键序和 Python API 一致；缺字段、未知字段、记录数量超限、时间类型或范围非法、时间倒退、记录形状或取值不合法均按 argument 错误处理（退出码 2），不输出部分结果。
 * 输入规模受 4096 字节上限约束；argument 错误退出码 2，message 错误退出码 3，错误以固定 JSON 结构写入标准错误。
 
 ## 状态

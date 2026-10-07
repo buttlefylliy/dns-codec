@@ -45,10 +45,16 @@ CNAME synthesis entry point: given a query name, a DNAME record mapping
 and the delegation cuts between them, it decides whether a CNAME may be
 synthesized and builds it without ever mutating its inputs.
 
+age_cached_records ages a cache snapshot of resource records by an
+explicitly supplied pair of timestamps: records whose TTL outlives the
+elapsed time are kept with the remaining TTL, the rest expire. No clock
+is read and no hidden state is involved.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
-synthesize_dname_cname, DNSArgumentError, DNSMessageError.
+synthesize_dname_cname, age_cached_records,
+DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -69,6 +75,7 @@ __all__ = [
     "encode_message",
     "decode_message",
     "synthesize_dname_cname",
+    "age_cached_records",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -142,6 +149,7 @@ MAX_NAME_LENGTH = 255
 MAX_MESSAGE_LENGTH = 65535
 MAX_COMPRESSION_POINTERS = 128
 MAX_DELEGATION_CUTS = 128
+MAX_CACHED_RECORDS = 128
 _POINTER_BITS = 0xC0
 
 
@@ -1171,6 +1179,79 @@ def synthesize_dname_cname(qname, dname, delegation_cuts):
     return result
 
 
+# Fixed key order of an aged record, by record type.
+_AGE_RECORD_FIELDS = {
+    _TYPE_A: RECORD_FIELDS,
+    _TYPE_AAAA: RECORD_FIELDS,
+    _TYPE_NS: NS_RECORD_FIELDS,
+    _TYPE_CNAME: CNAME_RECORD_FIELDS,
+    _TYPE_DNAME: DNAME_RECORD_FIELDS,
+    _TYPE_SOA: SOA_RECORD_FIELDS,
+    _TYPE_TXT: TXT_RECORD_FIELDS,
+}
+
+
+def age_cached_records(records, stored_at, now):
+    """Age a cache snapshot of resource records by an explicit time pair.
+
+    ``records`` is a list or tuple of at most 128 resource record
+    mappings, each following the encode_resource_record rules (A, AAAA,
+    CNAME, NS, DNAME, SOA or TXT); ``stored_at`` and ``now`` are
+    non-negative 64-bit integer timestamps in seconds (bools are never
+    accepted) and ``now`` must not be earlier than ``stored_at``. No
+    clock is read: the elapsed time is exactly ``now - stored_at``.
+    Every record is fully validated before any result is produced.
+    Records whose original TTL is greater than the elapsed time are kept
+    in input order with the TTL replaced by the remaining lifetime;
+    records whose TTL is less than or equal to the elapsed time expire
+    and do not appear in the result (a zero TTL therefore expires even
+    when ``now`` equals ``stored_at``). Returns a new mapping with the
+    fixed key order records, expired: ``records`` holds one new mapping
+    per surviving record in the fixed key order of its type, every
+    field except ``ttl`` copied unchanged, and ``expired`` is the
+    number of dropped records. The input records and containers are
+    never mutated and identical inputs produce identical results.
+    Raises DNSArgumentError for any invalid input.
+    """
+    if not isinstance(records, (list, tuple)):
+        raise DNSArgumentError("records must be a sequence")
+    if len(records) > MAX_CACHED_RECORDS:
+        raise DNSArgumentError(
+            "records exceeds %d entries" % MAX_CACHED_RECORDS
+        )
+    _check_uint(stored_at, "stored_at", 64)
+    _check_uint(now, "now", 64)
+    if now < stored_at:
+        raise DNSArgumentError("now must not be earlier than stored_at")
+
+    # Validate every record against the public resource record rules
+    # before producing any result.
+    for record in records:
+        encode_resource_record(record)
+
+    elapsed = now - stored_at
+    aged = []
+    expired = 0
+    for record in records:
+        ttl = record["ttl"]
+        if ttl <= elapsed:
+            expired += 1
+            continue
+        fresh = {}
+        for field_name in _AGE_RECORD_FIELDS[record["type"]]:
+            if field_name == "ttl":
+                fresh["ttl"] = ttl - elapsed
+            elif field_name == "strings":
+                # A fresh list so the result shares no container with
+                # the caller's record.
+                fresh["strings"] = list(record["strings"])
+            else:
+                fresh[field_name] = record[field_name]
+        aged.append(fresh)
+
+    return {"records": aged, "expired": expired}
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -1359,6 +1440,24 @@ def _cmd_synthesize_dname():
     return 0
 
 
+_AGE_CACHE_FIELDS = ("records", "stored_at", "now")
+_AGE_CACHE_FIELD_SET = frozenset(_AGE_CACHE_FIELDS)
+
+
+def _cmd_age_cache():
+    obj = _read_json_object()
+    for field_name in _AGE_CACHE_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _AGE_CACHE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = age_cached_records(obj["records"], obj["stored_at"], obj["now"])
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -1400,6 +1499,10 @@ def main(argv=None):
         "synthesize-dname",
         help="read a UTF-8 JSON object with qname, dname and delegation_cuts from stdin and print the synthesis result as JSON",
     )
+    subparsers.add_parser(
+        "age-cache",
+        help="read a UTF-8 JSON object with records, stored_at and now from stdin and print the aged cache snapshot as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1419,7 +1522,9 @@ def main(argv=None):
             return _cmd_encode_message()
         if args.command == "decode-message":
             return _cmd_decode_message()
-        return _cmd_synthesize_dname()
+        if args.command == "synthesize-dname":
+            return _cmd_synthesize_dname()
+        return _cmd_age_cache()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

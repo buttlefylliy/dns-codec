@@ -40,10 +40,15 @@ question, answer, authority and additional sections; encode_message and
 decode_message convert between the wire form and a mapping with the keys
 header, questions, answers, authorities and additionals.
 
+synthesize_dname_cname performs the DNAME CNAME synthesis of RFC 6672
+section 3.2 as a standalone step: given a query name, a DNAME record
+mapping and the delegation cuts between them, it decides whether a CNAME
+record may be synthesized and, if so, builds it.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
-DNSArgumentError, DNSMessageError.
+synthesize_dname_cname, DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -63,6 +68,7 @@ __all__ = [
     "decode_resource_record",
     "encode_message",
     "decode_message",
+    "synthesize_dname_cname",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -135,6 +141,7 @@ MAX_LABEL_LENGTH = 63
 MAX_NAME_LENGTH = 255
 MAX_MESSAGE_LENGTH = 65535
 MAX_COMPRESSION_POINTERS = 128
+MAX_DELEGATION_CUTS = 128
 _POINTER_BITS = 0xC0
 
 
@@ -1059,6 +1066,126 @@ def decode_message(data):
     }
 
 
+_DNAME_FIELD_SET = frozenset(DNAME_RECORD_FIELDS)
+
+
+def _name_labels(name):
+    # ``name`` is a validated absolute name; the root (".") yields no labels.
+    body = name[:-1]
+    return body.split(".") if body else []
+
+
+def _is_strictly_below(qname_labels, owner_labels):
+    # Label-wise ASCII case-insensitive ancestor test: qname must have
+    # strictly more labels than the owner and end with the owner's labels.
+    depth = len(owner_labels)
+    if len(qname_labels) <= depth:
+        return False
+    if depth == 0:
+        return True
+    suffix = qname_labels[len(qname_labels) - depth:]
+    return all(
+        q_label.lower() == o_label.lower()
+        for q_label, o_label in zip(suffix, owner_labels)
+    )
+
+
+def synthesize_dname_cname(qname, dname, delegation_cuts):
+    """Synthesize a CNAME record from a DNAME record (RFC 6672 section 3.2).
+
+    ``qname`` is an absolute ASCII domain name, ``dname`` a mapping with
+    exactly the keys name, type, class, ttl and target of a DNAME record
+    (``type`` the integer 39, ``class`` a 16-bit and ``ttl`` a 32-bit
+    unsigned integer, ``name`` and ``target`` absolute ASCII domain
+    names), and ``delegation_cuts`` a sequence of at most 128 absolute
+    ASCII domain names. Name matching compares labels one by one, ASCII
+    case-insensitively; a plain string suffix is never treated as a
+    domain ancestor.
+
+    Returns a mapping with the fixed key order status, cname. ``status``
+    is "synthesized" when ``qname`` lies strictly below the DNAME owner
+    name and no delegation cut falls on the label path from the owner
+    name to ``qname`` (endpoints included); the ``cname`` mapping then
+    has the fixed key order name, type, class, ttl, target, with ``name``
+    the original ``qname``, ``type`` 5, ``class`` and ``ttl`` taken from
+    the DNAME record and ``target`` the qname prefix labels (original
+    case) prepended to the DNAME target (original case). ``status`` is
+    "not-applicable" (with ``cname`` None) when ``qname`` equals the
+    owner name, belongs to another branch, or a delegation cut blocks
+    the path, and "name-too-long" (with ``cname`` None) when the
+    synthesized target would exceed 255 wire bytes; no partial record is
+    produced in that case. Validation is completed before any result is
+    produced; the arguments are never mutated. Raises DNSArgumentError
+    for any invalid input.
+    """
+    # Validate all inputs before producing any output.
+    encode_name(qname)
+
+    if not isinstance(dname, Mapping):
+        raise DNSArgumentError("dname must be a mapping")
+    for name in DNAME_RECORD_FIELDS:
+        if name not in dname:
+            raise DNSArgumentError("missing field: %s" % name)
+    for key in dname:
+        if key not in _DNAME_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    encode_name(dname["name"])
+    encode_name(dname["target"])
+    rtype = dname["type"]
+    _check_uint(rtype, "type", 16)
+    if rtype != _TYPE_DNAME:
+        raise DNSArgumentError("field 'type' must be 39 (DNAME)")
+    _check_uint(dname["class"], "class", 16)
+    _check_uint(dname["ttl"], "ttl", 32)
+
+    if not isinstance(delegation_cuts, (list, tuple)):
+        raise DNSArgumentError("delegation_cuts must be a sequence")
+    if len(delegation_cuts) > MAX_DELEGATION_CUTS:
+        raise DNSArgumentError(
+            "delegation_cuts exceeds %d entries" % MAX_DELEGATION_CUTS
+        )
+    for cut in delegation_cuts:
+        encode_name(cut)
+
+    qname_labels = _name_labels(qname)
+    owner_labels = _name_labels(dname["name"])
+
+    status = "not-applicable"
+    cname = None
+    if _is_strictly_below(qname_labels, owner_labels):
+        qname_lower = [label.lower() for label in qname_labels]
+        blocked = False
+        for cut in delegation_cuts:
+            cut_lower = [label.lower() for label in _name_labels(cut)]
+            depth = len(cut_lower)
+            # A cut blocks synthesis only when it lies on the label path
+            # from the owner name to qname, endpoints included.
+            if (
+                len(owner_labels) <= depth <= len(qname_labels)
+                and qname_lower[len(qname_lower) - depth:] == cut_lower
+            ):
+                blocked = True
+                break
+        if not blocked:
+            prefix = qname_labels[: len(qname_labels) - len(owner_labels)]
+            target_labels = prefix + _name_labels(dname["target"])
+            # Labels are ASCII, so character count equals wire byte count.
+            wire_length = 1 + sum(1 + len(label) for label in target_labels)
+            if wire_length > MAX_NAME_LENGTH:
+                status = "name-too-long"
+            else:
+                status = "synthesized"
+                cname = {
+                    "name": qname,
+                    "type": _TYPE_CNAME,
+                    "class": dname["class"],
+                    "ttl": dname["ttl"],
+                    "target": ".".join(target_labels) + ".",
+                }
+
+    return {"status": status, "cname": cname}
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -1227,6 +1354,26 @@ def _cmd_decode_message():
     return 0
 
 
+_SYNTHESIZE_FIELDS = ("qname", "dname", "delegation_cuts")
+_SYNTHESIZE_FIELD_SET = frozenset(_SYNTHESIZE_FIELDS)
+
+
+def _cmd_synthesize_dname():
+    obj = _read_json_object()
+    for name in _SYNTHESIZE_FIELDS:
+        if name not in obj:
+            raise DNSArgumentError("missing field: %s" % name)
+    for key in obj:
+        if key not in _SYNTHESIZE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = synthesize_dname_cname(
+        obj["qname"], obj["dname"], obj["delegation_cuts"]
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -1264,6 +1411,10 @@ def main(argv=None):
         "decode-message",
         help="read hexadecimal wire bytes from stdin and print the full message as JSON",
     )
+    subparsers.add_parser(
+        "synthesize-dname",
+        help="read a UTF-8 JSON object with qname, dname and delegation_cuts from stdin and print the synthesis result as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1281,7 +1432,9 @@ def main(argv=None):
             return _cmd_decode_record()
         if args.command == "encode-message":
             return _cmd_encode_message()
-        return _cmd_decode_message()
+        if args.command == "decode-message":
+            return _cmd_decode_message()
+        return _cmd_synthesize_dname()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

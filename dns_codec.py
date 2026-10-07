@@ -59,6 +59,12 @@ same full validation and uniform aging it returns the still-live
 records whose owner name, type and class match the question, with
 names compared label by label using ASCII case folding.
 
+lookup_cache_chain answers the same question but follows CNAME alias
+chains through the aged snapshot: each step matches the current name
+against the question type first and otherwise, when the question type
+is not CNAME, against a CNAME RRset whose single target becomes the
+next name, bounded by a fixed hop limit and guarded against loops.
+
 update_cache builds a new cache snapshot from an old one and a batch
 of incoming records: the old snapshot is aged to the current event
 time and every RRset supplied by the incoming batch replaces the
@@ -81,7 +87,8 @@ transport name are consulted; no body, clock or network is read.
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
-synthesize_dname_cname, age_cached_records, lookup_cache, update_cache,
+synthesize_dname_cname, age_cached_records, lookup_cache,
+lookup_cache_chain, update_cache,
 select_referral, plan_truncation_retry, DNSArgumentError,
 DNSMessageError.
 """
@@ -106,6 +113,7 @@ __all__ = [
     "synthesize_dname_cname",
     "age_cached_records",
     "lookup_cache",
+    "lookup_cache_chain",
     "update_cache",
     "select_referral",
     "plan_truncation_retry",
@@ -216,6 +224,7 @@ MAX_COMPRESSION_POINTERS = 128
 MAX_DELEGATION_CUTS = 128
 MAX_CACHED_RECORDS = 128
 MAX_REFERRAL_RECORDS = 128
+MAX_CHAIN_HOPS = 16
 _POINTER_BITS = 0xC0
 
 
@@ -1569,6 +1578,113 @@ def lookup_cache(records, stored_at, now, qname, qtype, qclass):
     }
 
 
+def lookup_cache_chain(records, stored_at, now, qname, qtype, qclass):
+    """Answer a DNS question, following CNAME aliases through the cache.
+
+    ``records``, ``stored_at``, ``now``, ``qname``, ``qtype`` and
+    ``qclass`` follow exactly the lookup_cache rules: the snapshot is
+    fully validated before any result is produced, every record is aged
+    uniformly by ``now - stored_at`` and ``expired`` counts the records
+    that expire across the whole snapshot during this aging pass. Names
+    are compared label by label with ASCII case-insensitive matching
+    while type and class are exact integer matches.
+
+    The walk starts at ``qname``. At each step the still-live records
+    of class ``qclass`` owned by the current name are consulted: when a
+    ``qtype`` RRset is present its records are appended in input order
+    and the walk ends with status "hit". Otherwise, when ``qtype`` is
+    not CNAME and a CNAME RRset is present, that RRset is appended in
+    input order and the walk continues at its target (one hop); every
+    CNAME record of the same node must point at the same target under
+    label comparison, otherwise DNSArgumentError is raised. When
+    ``qtype`` is CNAME only the direct match applies and no alias is
+    ever followed. A step with no usable record ends with status
+    "miss"; arriving again at an already visited name ends with status
+    "loop"; at most sixteen redirects are followed, so a step that
+    would require a seventeenth hop ends with status "hop-limit". The
+    "loop" and "hop-limit" statuses keep the chain collected before
+    termination: the duplicate node and the seventeenth hop contribute
+    nothing. Returns a new mapping with the fixed key order status,
+    records, expired: ``records`` holds each step's CNAME RRset and, on
+    "hit" only, the final ``qtype`` RRset in traversal order, every
+    record keeping its type's fixed key order, the original name case
+    and every field value except the remaining TTL. The input
+    containers, records and TXT strings are never mutated, no clock is
+    read and identical inputs produce identical results. Raises
+    DNSArgumentError for any invalid input.
+    """
+    # Validate the whole snapshot before the question, as contracted.
+    _validate_cached_records(records)
+    _check_cache_timestamps(stored_at, now)
+
+    encode_name(qname)
+    _check_uint(qtype, "qtype", 16)
+    if qtype not in _SUPPORTED_RECORD_TYPES:
+        raise DNSArgumentError(
+            "field 'qtype' must be 1 (A), 2 (NS), 5 (CNAME), 6 (SOA),"
+            " 15 (MX), 16 (TXT), 28 (AAAA), 33 (SRV) or 39 (DNAME)"
+        )
+    _check_uint(qclass, "qclass", 16)
+
+    aged, expired = _age_validated_records(records, now - stored_at)
+
+    # Group the surviving records by (owner labels, class), keeping the
+    # input order inside each group.
+    by_owner = {}
+    for record in aged:
+        key = (
+            tuple(label.lower() for label in _split_labels(record["name"])),
+            record["class"],
+        )
+        by_owner.setdefault(key, []).append(record)
+
+    chain = []
+    current = tuple(label.lower() for label in _split_labels(qname))
+    visited = {current}
+    hops = 0
+    status = None
+    while status is None:
+        bucket = by_owner.get((current, qclass), ())
+        direct = [record for record in bucket if record["type"] == qtype]
+        if direct:
+            chain.extend(direct)
+            status = "hit"
+        elif qtype == _TYPE_CNAME:
+            # A CNAME question only matches directly; no alias is followed.
+            status = "miss"
+        else:
+            aliases = [
+                record for record in bucket if record["type"] == _TYPE_CNAME
+            ]
+            if not aliases:
+                status = "miss"
+            elif hops >= MAX_CHAIN_HOPS:
+                # A seventeenth hop is never followed nor collected.
+                status = "hop-limit"
+            else:
+                targets = {
+                    tuple(
+                        label.lower()
+                        for label in _split_labels(record["target"])
+                    )
+                    for record in aliases
+                }
+                if len(targets) != 1:
+                    raise DNSArgumentError(
+                        "CNAME records at one node must share a single target"
+                    )
+                chain.extend(aliases)
+                hops += 1
+                (target,) = targets
+                if target in visited:
+                    status = "loop"
+                else:
+                    visited.add(target)
+                    current = target
+
+    return {"status": status, "records": chain, "expired": expired}
+
+
 def _rrset_key(record):
     # Identity of an RRset for cache replacement: the owner name as
     # lowercase DNS labels, the exact type and the exact class.
@@ -2074,6 +2190,31 @@ def _cmd_lookup_cache():
     return 0
 
 
+_LOOKUP_CACHE_CHAIN_FIELDS = _LOOKUP_CACHE_FIELDS
+_LOOKUP_CACHE_CHAIN_FIELD_SET = _LOOKUP_CACHE_FIELD_SET
+
+
+def _cmd_lookup_cache_chain():
+    obj = _read_json_object()
+    for field_name in _LOOKUP_CACHE_CHAIN_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _LOOKUP_CACHE_CHAIN_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = lookup_cache_chain(
+        obj["records"],
+        obj["stored_at"],
+        obj["now"],
+        obj["qname"],
+        obj["qtype"],
+        obj["qclass"],
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 _UPDATE_CACHE_FIELDS = ("records", "stored_at", "now", "incoming")
 _UPDATE_CACHE_FIELD_SET = frozenset(_UPDATE_CACHE_FIELDS)
 
@@ -2192,6 +2333,10 @@ def main(argv=None):
         help="read a UTF-8 JSON object with records, stored_at, now, qname, qtype and qclass from stdin and print the cache lookup result as JSON",
     )
     subparsers.add_parser(
+        "lookup-cache-chain",
+        help="read a UTF-8 JSON object with records, stored_at, now, qname, qtype and qclass from stdin and print the CNAME chain lookup result as JSON",
+    )
+    subparsers.add_parser(
         "update-cache",
         help="read a UTF-8 JSON object with records, stored_at, now and incoming from stdin and print the updated cache snapshot as JSON",
     )
@@ -2228,6 +2373,8 @@ def main(argv=None):
             return _cmd_age_cache()
         if args.command == "lookup-cache":
             return _cmd_lookup_cache()
+        if args.command == "lookup-cache-chain":
+            return _cmd_lookup_cache_chain()
         if args.command == "update-cache":
             return _cmd_update_cache()
         if args.command == "select-referral":

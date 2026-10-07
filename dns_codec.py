@@ -101,13 +101,22 @@ authority section whose owner name is a label ancestor of the question
 name and derives the negative TTL from that SOA. No clock or network is
 read and no hidden state is kept.
 
+extract_nodata_cache turns an authoritative NODATA (rcode 0 with an
+empty answer section) response into a negative cache entry for the
+question's name and type: after the same full validation and
+correlation it requires an untruncated authoritative response and
+selects the deepest same-class SOA in the authority section whose
+owner name is a label ancestor of the question name, deriving the
+negative TTL from that SOA. No clock or network is read and no hidden
+state is kept.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
 synthesize_dname_cname, age_cached_records, lookup_cache,
 lookup_cache_chain, update_cache,
 select_referral, plan_truncation_retry, plan_response_acceptance,
-extract_nxdomain_cache,
+extract_nxdomain_cache, extract_nodata_cache,
 DNSArgumentError, DNSMessageError.
 """
 
@@ -137,6 +146,7 @@ __all__ = [
     "plan_truncation_retry",
     "plan_response_acceptance",
     "extract_nxdomain_cache",
+    "extract_nodata_cache",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -2211,6 +2221,123 @@ def extract_nxdomain_cache(query, response):
     return result
 
 
+def extract_nodata_cache(query, response):
+    """Turn an authoritative NODATA response into a negative cache entry.
+
+    ``query`` and ``response`` are full message mappings following the
+    encode_message rules (exactly the keys header, questions, answers,
+    authorities and additionals, with the header counts matching their
+    sections and every question and record valid); the query header's
+    ``qr`` must be False, the response header's ``qr`` must be True and
+    each message must carry exactly one question. Both messages are
+    fully validated -- every section, count and record -- before any
+    decision is made and the inputs are never mutated (TXT containers
+    included). No clock or network is read and no hidden state is
+    kept, so identical inputs produce identical results.
+
+    The header ``id`` and ``opcode`` and the question name, ``qtype``
+    and ``qclass`` are compared in that order, the name label by label
+    with ASCII case-insensitive matching (never as a plain string suffix
+    or a whole-string lowercase); when any of them differs the result is
+    "unmatched" with ``entry`` None. When they all match but the
+    response ``rcode`` is not 0 the result is "not-nodata" with
+    ``entry`` None. With rcode 0 the response yields a cache entry only
+    when it is not truncated, the ``aa`` flag is True, the answer
+    section is empty and the authority section holds a qualifying SOA;
+    otherwise the result is "not-cacheable" with ``entry`` None. A
+    qualifying SOA is a type 6 record of the question's class whose
+    owner name is a label ancestor of the question name (the question
+    name itself included); the qualifying SOA with the deepest owner
+    name is chosen and on equal depth the first one in
+    authority-section order wins. On success the result is "cacheable"
+    and ``entry`` is a new mapping with the fixed key order name, type,
+    class, ttl: ``name`` keeps the query question's name with its
+    original case, ``type`` and ``class`` come from the query question
+    and ``ttl`` is the lesser of the SOA record's ``ttl`` and its
+    ``minimum`` -- a zero TTL is returned as-is for the existing aging
+    semantics to expire immediately. Raises DNSArgumentError for any
+    invalid input.
+    """
+    # Validate both messages completely -- every section, count and
+    # record -- before any role or correlation check; encode_message
+    # performs the full validation without mutating its argument and
+    # its wire result is discarded here.
+    encode_message(query)
+    encode_message(response)
+
+    query_header = query["header"]
+    response_header = response["header"]
+    if query_header["qr"] is not False:
+        raise DNSArgumentError("query header field 'qr' must be false")
+    if response_header["qr"] is not True:
+        raise DNSArgumentError("response header field 'qr' must be true")
+
+    if len(query["questions"]) != 1:
+        raise DNSArgumentError("query must contain exactly one question")
+    if len(response["questions"]) != 1:
+        raise DNSArgumentError("response must contain exactly one question")
+
+    result = {"status": None, "entry": None}
+
+    query_question = query["questions"][0]
+    response_question = response["questions"][0]
+    query_labels = [label.lower() for label in _split_labels(query_question["name"])]
+    response_labels = [
+        label.lower() for label in _split_labels(response_question["name"])
+    ]
+    if (
+        query_header["id"] != response_header["id"]
+        or query_header["opcode"] != response_header["opcode"]
+        or query_question["qtype"] != response_question["qtype"]
+        or query_question["qclass"] != response_question["qclass"]
+        or query_labels != response_labels
+    ):
+        result["status"] = "unmatched"
+        return result
+
+    # Any non-zero rcode is a different answer than the rcode 0 NODATA
+    # shape, regardless of the other flags and sections.
+    if response_header["rcode"] != 0:
+        result["status"] = "not-nodata"
+        return result
+
+    # A NODATA negative entry requires an untruncated authoritative
+    # reply with an empty answer section.
+    if response_header["tc"] or not response_header["aa"] or response["answers"]:
+        result["status"] = "not-cacheable"
+        return result
+
+    # The deepest same-class SOA owner on the question name's ancestor
+    # path wins; equal depth keeps authority-section order, so the
+    # strict comparison only replaces a strictly shallower match.
+    qclass = query_question["qclass"]
+    selected = None
+    selected_depth = None
+    for record in response["authorities"]:
+        if record["type"] != _TYPE_SOA or record["class"] != qclass:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(record["name"])]
+        depth = len(owner_labels)
+        if not _labels_at_or_below(query_labels, owner_labels):
+            continue
+        if selected is None or depth > selected_depth:
+            selected = record
+            selected_depth = depth
+
+    if selected is None:
+        result["status"] = "not-cacheable"
+        return result
+
+    result["status"] = "cacheable"
+    result["entry"] = {
+        "name": query_question["name"],
+        "type": query_question["qtype"],
+        "class": qclass,
+        "ttl": min(selected["ttl"], selected["minimum"]),
+    }
+    return result
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -2575,6 +2702,24 @@ def _cmd_extract_nxdomain_cache():
     return 0
 
 
+_EXTRACT_NODATA_FIELDS = ("query", "response")
+_EXTRACT_NODATA_FIELD_SET = frozenset(_EXTRACT_NODATA_FIELDS)
+
+
+def _cmd_extract_nodata_cache():
+    obj = _read_json_object()
+    for field_name in _EXTRACT_NODATA_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _EXTRACT_NODATA_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = extract_nodata_cache(obj["query"], obj["response"])
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -2648,6 +2793,10 @@ def main(argv=None):
         "extract-nxdomain-cache",
         help="read a UTF-8 JSON object with query and response from stdin and print the NXDOMAIN negative cache decision as JSON",
     )
+    subparsers.add_parser(
+        "extract-nodata-cache",
+        help="read a UTF-8 JSON object with query and response from stdin and print the NODATA negative cache decision as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -2683,6 +2832,8 @@ def main(argv=None):
             return _cmd_plan_truncation_retry()
         if args.command == "extract-nxdomain-cache":
             return _cmd_extract_nxdomain_cache()
+        if args.command == "extract-nodata-cache":
+            return _cmd_extract_nodata_cache()
         return _cmd_plan_response_acceptance()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)

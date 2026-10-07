@@ -50,10 +50,15 @@ explicitly supplied pair of timestamps: records whose TTL outlives the
 elapsed time are kept with the remaining TTL, the rest expire. No clock
 is read and no hidden state is involved.
 
+lookup_cache answers a DNS question against such a snapshot: after the
+same full validation and uniform aging it returns the still-live
+records whose owner name, type and class match the question, with
+names compared label by label using ASCII case folding.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
-synthesize_dname_cname, age_cached_records,
+synthesize_dname_cname, age_cached_records, lookup_cache,
 DNSArgumentError, DNSMessageError.
 """
 
@@ -76,6 +81,7 @@ __all__ = [
     "decode_message",
     "synthesize_dname_cname",
     "age_cached_records",
+    "lookup_cache",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -137,6 +143,9 @@ _TYPE_SOA = 6
 _TYPE_TXT = 16
 _TYPE_AAAA = 28
 _TYPE_DNAME = 39
+_SUPPORTED_RECORD_TYPES = frozenset(
+    (_TYPE_A, _TYPE_NS, _TYPE_CNAME, _TYPE_SOA, _TYPE_TXT, _TYPE_AAAA, _TYPE_DNAME)
+)
 _A_RDATA_LENGTH = 4
 _AAAA_RDATA_LENGTH = 16
 _SOA_TIMERS_LENGTH = _SOA_TIMERS_STRUCT.size
@@ -1191,6 +1200,51 @@ _AGE_RECORD_FIELDS = {
 }
 
 
+def _validate_cached_records(records):
+    # Shared snapshot validation for age_cached_records/lookup_cache:
+    # shape, count and every record's public rules are checked here.
+    if not isinstance(records, (list, tuple)):
+        raise DNSArgumentError("records must be a sequence")
+    if len(records) > MAX_CACHED_RECORDS:
+        raise DNSArgumentError(
+            "records exceeds %d entries" % MAX_CACHED_RECORDS
+        )
+    for record in records:
+        encode_resource_record(record)
+
+
+def _check_cache_timestamps(stored_at, now):
+    _check_uint(stored_at, "stored_at", 64)
+    _check_uint(now, "now", 64)
+    if now < stored_at:
+        raise DNSArgumentError("now must not be earlier than stored_at")
+
+
+def _age_validated_records(records, elapsed):
+    # Shared aging pass over already-validated records. Returns
+    # (aged_records, expired_count); each surviving record is a new
+    # mapping sharing no container with the caller's record.
+    aged = []
+    expired = 0
+    for record in records:
+        ttl = record["ttl"]
+        if ttl <= elapsed:
+            expired += 1
+            continue
+        fresh = {}
+        for field_name in _AGE_RECORD_FIELDS[record["type"]]:
+            if field_name == "ttl":
+                fresh["ttl"] = ttl - elapsed
+            elif field_name == "strings":
+                # A fresh list so the result shares no container with
+                # the caller's record.
+                fresh["strings"] = list(record["strings"])
+            else:
+                fresh[field_name] = record[field_name]
+        aged.append(fresh)
+    return aged, expired
+
+
 def age_cached_records(records, stored_at, now):
     """Age a cache snapshot of resource records by an explicit time pair.
 
@@ -1213,43 +1267,77 @@ def age_cached_records(records, stored_at, now):
     never mutated and identical inputs produce identical results.
     Raises DNSArgumentError for any invalid input.
     """
-    if not isinstance(records, (list, tuple)):
-        raise DNSArgumentError("records must be a sequence")
-    if len(records) > MAX_CACHED_RECORDS:
-        raise DNSArgumentError(
-            "records exceeds %d entries" % MAX_CACHED_RECORDS
-        )
-    _check_uint(stored_at, "stored_at", 64)
-    _check_uint(now, "now", 64)
-    if now < stored_at:
-        raise DNSArgumentError("now must not be earlier than stored_at")
+    _validate_cached_records(records)
+    _check_cache_timestamps(stored_at, now)
 
-    # Validate every record against the public resource record rules
-    # before producing any result.
-    for record in records:
-        encode_resource_record(record)
-
-    elapsed = now - stored_at
-    aged = []
-    expired = 0
-    for record in records:
-        ttl = record["ttl"]
-        if ttl <= elapsed:
-            expired += 1
-            continue
-        fresh = {}
-        for field_name in _AGE_RECORD_FIELDS[record["type"]]:
-            if field_name == "ttl":
-                fresh["ttl"] = ttl - elapsed
-            elif field_name == "strings":
-                # A fresh list so the result shares no container with
-                # the caller's record.
-                fresh["strings"] = list(record["strings"])
-            else:
-                fresh[field_name] = record[field_name]
-        aged.append(fresh)
+    aged, expired = _age_validated_records(records, now - stored_at)
 
     return {"records": aged, "expired": expired}
+
+
+def lookup_cache(records, stored_at, now, qname, qtype, qclass):
+    """Answer a DNS question against an aged cache snapshot.
+
+    ``records`` is a list or tuple of at most 128 resource record
+    mappings following the encode_resource_record rules (A, AAAA,
+    CNAME, NS, DNAME, SOA or TXT); ``stored_at`` and ``now`` are
+    non-negative 64-bit integer timestamps in seconds (bools are never
+    accepted) and ``now`` must not be earlier than ``stored_at``.
+    ``qname`` is an absolute ASCII domain name, ``qtype`` one of the
+    supported record types 1 (A), 2 (NS), 5 (CNAME), 6 (SOA), 16
+    (TXT), 28 (AAAA) or 39 (DNAME) and ``qclass`` a 16-bit unsigned
+    integer (bools are never accepted). The whole snapshot is fully
+    validated first and the timestamps are checked before the question
+    is validated; no partial result is ever produced. Every record is
+    then aged uniformly by ``now - stored_at`` exactly as in
+    age_cached_records (a TTL less than or equal to the elapsed time
+    expires, so a zero TTL expires even when ``now`` equals
+    ``stored_at``). Among the surviving records those whose owner name,
+    type and class all match the question are selected: names are
+    compared label by label with ASCII case-insensitive matching,
+    never as plain string prefixes or suffixes, while type and class
+    are exact integer matches. Returns a new mapping with the fixed
+    key order status, records, expired: ``status`` is "hit" when at
+    least one record matches and "miss" otherwise (an empty snapshot
+    is a deterministic miss), ``records`` holds the matching aged
+    records in input order with each type's fixed key order, the
+    original name case and every field value except the remaining
+    TTL preserved, and ``expired`` is the number of records that
+    expired across the whole snapshot during this aging pass. The
+    input containers, records and TXT strings are never mutated and
+    identical inputs produce identical results. Raises
+    DNSArgumentError for any invalid input.
+    """
+    # Validate the whole snapshot before the question, as contracted.
+    _validate_cached_records(records)
+    _check_cache_timestamps(stored_at, now)
+
+    encode_name(qname)
+    _check_uint(qtype, "qtype", 16)
+    if qtype not in _SUPPORTED_RECORD_TYPES:
+        raise DNSArgumentError(
+            "field 'qtype' must be 1 (A), 2 (NS), 5 (CNAME), 6 (SOA),"
+            " 16 (TXT), 28 (AAAA) or 39 (DNAME)"
+        )
+    _check_uint(qclass, "qclass", 16)
+
+    aged, expired = _age_validated_records(records, now - stored_at)
+
+    wanted_labels = [label.lower() for label in _split_labels(qname)]
+    matches = []
+    for record in aged:
+        if record["type"] != qtype or record["class"] != qclass:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(record["name"])]
+        if owner_labels != wanted_labels:
+            continue
+        matches.append(record)
+
+    return {
+        "status": "hit" if matches else "miss",
+        "records": matches,
+        "expired": expired,
+    }
 
 
 def _read_json_object():
@@ -1458,6 +1546,31 @@ def _cmd_age_cache():
     return 0
 
 
+_LOOKUP_CACHE_FIELDS = ("records", "stored_at", "now", "qname", "qtype", "qclass")
+_LOOKUP_CACHE_FIELD_SET = frozenset(_LOOKUP_CACHE_FIELDS)
+
+
+def _cmd_lookup_cache():
+    obj = _read_json_object()
+    for field_name in _LOOKUP_CACHE_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _LOOKUP_CACHE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = lookup_cache(
+        obj["records"],
+        obj["stored_at"],
+        obj["now"],
+        obj["qname"],
+        obj["qtype"],
+        obj["qclass"],
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -1503,6 +1616,10 @@ def main(argv=None):
         "age-cache",
         help="read a UTF-8 JSON object with records, stored_at and now from stdin and print the aged cache snapshot as JSON",
     )
+    subparsers.add_parser(
+        "lookup-cache",
+        help="read a UTF-8 JSON object with records, stored_at, now, qname, qtype and qclass from stdin and print the cache lookup result as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1524,7 +1641,9 @@ def main(argv=None):
             return _cmd_decode_message()
         if args.command == "synthesize-dname":
             return _cmd_synthesize_dname()
-        return _cmd_age_cache()
+        if args.command == "age-cache":
+            return _cmd_age_cache()
+        return _cmd_lookup_cache()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

@@ -86,13 +86,22 @@ response does not belong to the query, or truncation persists over TCP
 and automatic retries stop. Only the two fixed-size headers and the
 transport name are consulted; no body, clock or network is read.
 
+plan_response_acceptance confirms, before a response is accepted, that
+a complete response belongs to the original query: both complete
+messages are fully validated first (every section, count and record)
+and the header id and opcode and the single question's qtype, qclass
+and name are then compared (the names label by label with ASCII case
+folding) to accept, retry a truncated UDP exchange over TCP, stop on a
+response still truncated over TCP, or reject an unrelated response. No
+network, clock or hidden state is involved.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
 synthesize_dname_cname, age_cached_records, lookup_cache,
 lookup_cache_chain, update_cache,
-select_referral, plan_truncation_retry, DNSArgumentError,
-DNSMessageError.
+select_referral, plan_truncation_retry, plan_response_acceptance,
+DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -119,6 +128,7 @@ __all__ = [
     "update_cache",
     "select_referral",
     "plan_truncation_retry",
+    "plan_response_acceptance",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -1991,6 +2001,94 @@ def plan_truncation_retry(query_header, response_header, transport):
     return result
 
 
+def plan_response_acceptance(query, response, transport):
+    """Confirm that a complete response belongs to the original query.
+
+    ``query`` and ``response`` are full message mappings following the
+    encode_message rules (exactly the MESSAGE_FIELDS keys, the four
+    header counts matching their sections and every question and
+    resource record valid): the query's ``qr`` must be False and the
+    response's ``qr`` True, and each must carry exactly one question.
+    ``transport`` is the string "udp" or "tcp", the transport of the
+    exchange that produced ``response``. Both messages are fully
+    validated, section by section including every count and record,
+    before any decision is made and the inputs are never mutated. No
+    network, clock or hidden state is consulted and identical inputs
+    produce identical results.
+
+    After validation the header ``id`` and ``opcode`` and the single
+    question's ``qtype``, ``qclass`` and name are compared; the names
+    are compared label by label with ASCII case-insensitive matching,
+    never as plain string suffixes or whole-name lowercasing. Returns a
+    new mapping with the fixed key order status, next_transport: when
+    any correlation field differs the response does not belong to the
+    query and the result is "unmatched" with ``next_transport`` None;
+    when they match and the response ``tc`` is False the response is
+    accepted as-is with ``next_transport`` None, regardless of
+    ``rcode``, ``aa``, ``ra`` and the other flags; when they match,
+    ``tc`` is True and ``transport`` is "udp" the result is "retry"
+    with ``next_transport`` "tcp"; when the same truncation flag
+    arrives over "tcp" the result is "truncated" with
+    ``next_transport`` None, ending automatic retries. Raises
+    DNSArgumentError for any invalid input, including a wrong role or
+    a question count other than one; a validation failure is never
+    downgraded to "unmatched".
+    """
+    # Validate both complete messages (shape, fields, counts and every
+    # record) before any transport, role or correlation check; the wire
+    # bytes produced here are discarded and the caller's mappings are
+    # never mutated.
+    encode_message(query)
+    encode_message(response)
+
+    if not isinstance(transport, str) or transport not in _TRANSPORTS:
+        raise DNSArgumentError("transport must be 'udp' or 'tcp'")
+
+    if query["header"]["qr"] is not False:
+        raise DNSArgumentError("query header field 'qr' must be false")
+    if response["header"]["qr"] is not True:
+        raise DNSArgumentError("response header field 'qr' must be true")
+
+    if query["header"]["qdcount"] != 1 or len(query["questions"]) != 1:
+        raise DNSArgumentError("query must contain exactly one question")
+    if response["header"]["qdcount"] != 1 or len(response["questions"]) != 1:
+        raise DNSArgumentError("response must contain exactly one question")
+
+    query_header = query["header"]
+    response_header = response["header"]
+    query_question = query["questions"][0]
+    response_question = response["questions"][0]
+
+    result = {"status": None, "next_transport": None}
+
+    names_match = [
+        label.lower() for label in _split_labels(query_question["name"])
+    ] == [
+        label.lower() for label in _split_labels(response_question["name"])
+    ]
+    if (
+        query_header["id"] != response_header["id"]
+        or query_header["opcode"] != response_header["opcode"]
+        or query_question["qtype"] != response_question["qtype"]
+        or query_question["qclass"] != response_question["qclass"]
+        or not names_match
+    ):
+        result["status"] = "unmatched"
+        return result
+
+    if not response_header["tc"]:
+        result["status"] = "accept"
+        return result
+
+    if transport == "udp":
+        result["status"] = "retry"
+        result["next_transport"] = "tcp"
+        return result
+
+    result["status"] = "truncated"
+    return result
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -2315,6 +2413,28 @@ def _cmd_plan_truncation_retry():
     return 0
 
 
+_PLAN_ACCEPTANCE_FIELDS = ("query", "response", "transport")
+_PLAN_ACCEPTANCE_FIELD_SET = frozenset(_PLAN_ACCEPTANCE_FIELDS)
+
+
+def _cmd_plan_response_acceptance():
+    obj = _read_json_object()
+    for field_name in _PLAN_ACCEPTANCE_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _PLAN_ACCEPTANCE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = plan_response_acceptance(
+        obj["query"],
+        obj["response"],
+        obj["transport"],
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -2380,6 +2500,10 @@ def main(argv=None):
         "plan-truncation-retry",
         help="read a UTF-8 JSON object with query_header, response_header and transport from stdin and print the truncation retry decision as JSON",
     )
+    subparsers.add_parser(
+        "plan-response-acceptance",
+        help="read a UTF-8 JSON object with query, response and transport from stdin and print the response acceptance decision as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -2411,7 +2535,9 @@ def main(argv=None):
             return _cmd_update_cache()
         if args.command == "select-referral":
             return _cmd_select_referral()
-        return _cmd_plan_truncation_retry()
+        if args.command == "plan-truncation-retry":
+            return _cmd_plan_truncation_retry()
+        return _cmd_plan_response_acceptance()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

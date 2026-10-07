@@ -59,10 +59,18 @@ same full validation and uniform aging it returns the still-live
 records whose owner name, type and class match the question, with
 names compared label by label using ASCII case folding.
 
+update_cache refreshes such a snapshot with incoming records: the old
+snapshot is aged to the current event time, then every RRset named by
+the incoming records replaces all still-live records of the same owner
+name, type and class (case-insensitive labels, exact type and class),
+even when the whole replacement RRset carries a zero TTL; surviving new
+records are appended in input order. No clock is read, no hidden state
+is involved and no input container or record is mutated.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
-synthesize_dname_cname, age_cached_records, lookup_cache,
+synthesize_dname_cname, age_cached_records, lookup_cache, update_cache,
 DNSArgumentError, DNSMessageError.
 """
 
@@ -86,6 +94,7 @@ __all__ = [
     "synthesize_dname_cname",
     "age_cached_records",
     "lookup_cache",
+    "update_cache",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -1545,6 +1554,104 @@ def lookup_cache(records, stored_at, now, qname, qtype, qclass):
     }
 
 
+def _rrset_identity(record):
+    # Owner name (lowercased label by label, never as a plain string),
+    # type and class identify an RRset.
+    return (
+        tuple(label.lower() for label in _split_labels(record["name"])),
+        record["type"],
+        record["class"],
+    )
+
+
+def update_cache(records, stored_at, now, incoming):
+    """Refresh a cache snapshot with incoming resource records.
+
+    ``records`` and ``incoming`` are each a list or tuple of at most 128
+    resource record mappings following the encode_resource_record rules
+    (A, AAAA, CNAME, NS, DNAME, SOA, MX, TXT or SRV); ``stored_at`` and
+    ``now`` are non-negative 64-bit integer timestamps in seconds (bools
+    are never accepted) and ``now`` must not be earlier than
+    ``stored_at``. No clock is read: the old snapshot is aged by exactly
+    ``now - stored_at`` exactly as in age_cached_records, and a TTL less
+    than or equal to the elapsed time expires (so a zero TTL expires
+    even when ``now`` equals ``stored_at``). Every input is fully
+    validated before any result is produced.
+
+    An RRset is identified by owner name, type and class: names are
+    compared label by label with ASCII case-insensitive matching, never
+    as plain string prefixes or suffixes, while type and class are exact
+    integer matches. Every RRset present in ``incoming`` replaces all
+    still-live records of the same identity in the old snapshot; the
+    replacement still happens when every incoming record of that RRset
+    carries a zero TTL, in which case the RRset is simply removed. Old
+    records belonging to no replaced RRset keep their relative order and
+    remaining TTL; incoming records with a positive TTL are then appended
+    in input order with their TTL unchanged, and zero-TTL incoming
+    records never enter the result. Returns a new mapping with the fixed
+    key order records, stored_at, expired, replaced: ``stored_at``
+    equals ``now``, ``expired`` counts only the records dropped by aging
+    and ``replaced`` counts only the still-live old records removed by
+    replacement, each record using its type's existing fixed key order.
+    When the merged snapshot would hold more than 128 records,
+    DNSArgumentError is raised and nothing is truncated. The input
+    containers, records and TXT strings are never mutated and identical
+    inputs produce identical results. Raises DNSArgumentError for any
+    invalid input.
+    """
+    # Validate the whole old snapshot, the timestamps and the whole
+    # incoming batch before producing any result.
+    _validate_cached_records(records)
+    _check_cache_timestamps(stored_at, now)
+    _validate_cached_records(incoming)
+
+    aged, expired = _age_validated_records(records, now - stored_at)
+
+    # Every distinct RRset named by the incoming batch is replaced; the
+    # order of the incoming records is irrelevant to this identity set.
+    incoming_identities = set()
+    for record in incoming:
+        incoming_identities.add(_rrset_identity(record))
+
+    survivors = []
+    replaced = 0
+    for record in aged:
+        if _rrset_identity(record) in incoming_identities:
+            replaced += 1
+        else:
+            survivors.append(record)
+
+    additions = []
+    for record in incoming:
+        if record["ttl"] > 0:
+            additions.append(record)
+
+    if len(survivors) + len(additions) > MAX_CACHED_RECORDS:
+        raise DNSArgumentError(
+            "merged cache snapshot exceeds %d entries" % MAX_CACHED_RECORDS
+        )
+
+    # Rebuild every appended record as a fresh mapping in its type's
+    # fixed key order (with a fresh TXT strings list) so the result
+    # shares no container with the caller's incoming records.
+    fresh_additions = []
+    for record in additions:
+        fresh = {}
+        for field_name in _AGE_RECORD_FIELDS[record["type"]]:
+            if field_name == "strings":
+                fresh["strings"] = list(record["strings"])
+            else:
+                fresh[field_name] = record[field_name]
+        fresh_additions.append(fresh)
+
+    return {
+        "records": survivors + fresh_additions,
+        "stored_at": now,
+        "expired": expired,
+        "replaced": replaced,
+    }
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -1776,6 +1883,26 @@ def _cmd_lookup_cache():
     return 0
 
 
+_UPDATE_CACHE_FIELDS = ("records", "stored_at", "now", "incoming")
+_UPDATE_CACHE_FIELD_SET = frozenset(_UPDATE_CACHE_FIELDS)
+
+
+def _cmd_update_cache():
+    obj = _read_json_object()
+    for field_name in _UPDATE_CACHE_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _UPDATE_CACHE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = update_cache(
+        obj["records"], obj["stored_at"], obj["now"], obj["incoming"]
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -1825,6 +1952,10 @@ def main(argv=None):
         "lookup-cache",
         help="read a UTF-8 JSON object with records, stored_at, now, qname, qtype and qclass from stdin and print the cache lookup result as JSON",
     )
+    subparsers.add_parser(
+        "update-cache",
+        help="read a UTF-8 JSON object with records, stored_at, now and incoming from stdin and print the refreshed cache snapshot as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1848,7 +1979,9 @@ def main(argv=None):
             return _cmd_synthesize_dname()
         if args.command == "age-cache":
             return _cmd_age_cache()
-        return _cmd_lookup_cache()
+        if args.command == "lookup-cache":
+            return _cmd_lookup_cache()
+        return _cmd_update_cache()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

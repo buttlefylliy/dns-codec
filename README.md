@@ -28,6 +28,7 @@ DNS 问题报文与资源记录的编解码、压缩指针与 DNAME 语义。
 * 异常：`DNSArgumentError`、`DNSMessageError`。
 * 头部计数不会被问题编解码读取或修改。
 * `age_cached_records(records, stored_at, now)`：无隐藏状态的缓存快照老化入口，不读取系统时间。`records` 为至多 128 条现有支持类型（A、AAAA、CNAME、NS、DNAME、SOA、TXT）资源记录映射组成的 list 或 tuple，`stored_at` 与 `now` 为以秒为单位的非负 64 位整数（不接受布尔值），`now` 小于 `stored_at` 时抛出 `DNSArgumentError`。老化前完整校验所有记录均符合 `encode_resource_record` 的公开规则，随后以 `now - stored_at` 为统一经过时间：原 TTL 大于经过时间的记录按输入顺序保留并把 TTL 替换为两者之差，原 TTL 小于或等于经过时间的记录过期（TTL 为零的记录即使 `now` 等于 `stored_at` 也会过期）。返回键序固定为 `records`、`expired` 的新建映射：`records` 中每条记录使用其类型对应的既有固定键序，除 TTL 外的字段值保持不变，`expired` 为被删除的记录数；不修改输入记录或容器，相同输入产生逐字段一致的结果。
+* `lookup_cached_records(records, stored_at, now, qname, qtype, qclass)`：独立的缓存查询入口，不读取系统时间，不影响既有入口。`records`、`stored_at`、`now` 沿用 `age_cached_records` 的七种记录类型、字段约束、至多 128 条限制与时间规则（非负 64 位整数、不接受布尔值、`now` 不得早于 `stored_at`）；`qname` 为合法绝对 ASCII 域名，`qtype` 只能是当前支持的记录类型（整数 1、2、5、6、16、28 或 39），`qclass` 为 16 位无符号整数（所有整数参数均拒绝布尔值）。先完整校验整个快照，再按 `now - stored_at` 统一老化记录：TTL 小于或等于经过时间的记录过期（TTL 为零且时间相等时同样过期），不参与查询。从未过期记录中选择所有者名、类型和类均与问题匹配的结果：名称按 DNS 标签逐项做 ASCII 大小写不敏感比较（不采用普通字符串前后缀判断），类型与类按整数精确匹配。返回键序固定为 `status`、`records`、`expired` 的新建映射：存在匹配记录时 `status` 为 `hit`，否则为 `miss`（空快照为确定的 miss）；`records` 仅含匹配项，保持输入顺序、名称大小写及 TTL 之外的字段值，TTL 改为剩余值，记录键序沿用其类型对应的既有固定键序；`expired` 是本次老化时整个快照中过期记录的数量。校验完成前不返回部分结果，不修改输入容器、记录及 TXT strings，相同输入产生逐字段一致的结果；任何参数非法均抛出 `DNSArgumentError`。
 
 ### 命令行
 
@@ -40,6 +41,7 @@ DNS 问题报文与资源记录的编解码、压缩指针与 DNAME 语义。
 * `decode-message`：读取十六进制完整报文，输出键序固定为 `header`、`questions`、`answers`、`authorities`、`additionals` 的紧凑 JSON；截断、畸形、不支持的记录类型或尾随字节均按 message 错误处理（退出码 3）。
 * `synthesize-dname`：从标准输入读取仅含 `qname`、`dname`、`delegation_cuts` 的 UTF-8 JSON 对象，输出键序固定为 `status`、`cname` 的单行紧凑 JSON（`status` 为 `synthesized`、`not-applicable` 或 `name-too-long`，仅 `synthesized` 时 `cname` 非 `null`）；缺字段、未知字段或任何参数非法均按 argument 错误处理（退出码 2）。
 * `age-cache`：从标准输入读取仅含 `records`、`stored_at`、`now` 的 UTF-8 JSON 对象，输出键序固定为 `records`、`expired` 的单行紧凑 JSON，记录顺序与键序和 Python API 一致；缺字段、未知字段、记录数量超限、时间类型或范围非法、时间倒退、记录形状或取值不合法均按 argument 错误处理（退出码 2），不输出部分结果。
+* `lookup-cache`：从标准输入读取仅含 `records`、`stored_at`、`now`、`qname`、`qtype`、`qclass` 的 UTF-8 JSON 对象（至多 4096 字节），成功时输出单行紧凑 JSON，顶层字段顺序（`status`、`records`、`expired`）与记录键序和 Python API 一致，相同输入产生逐字节一致的输出；缺少或出现未知字段、JSON 形状错误、输入超限、记录非法或超量、时间非法或倒退、域名非法以及不支持的 qtype 均按 argument 错误处理（退出码 2）：向标准错误写入既有固定 argument 错误 JSON，退出码 2 结束且标准输出为空，不输出部分结果。
 * 输入规模受 4096 字节上限约束；argument 错误退出码 2，message 错误退出码 3，错误以固定 JSON 结构写入标准错误。
 
 ## 状态

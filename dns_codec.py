@@ -64,11 +64,17 @@ of incoming records: the old snapshot is aged to the current event
 time and every RRset supplied by the incoming batch replaces the
 matching aged records, all without hidden state or a wall clock.
 
+select_referral extracts a delegation referral from the authority and
+additional sections of a response: the closest enclosing NS RRset for
+the query name becomes the delegation cut and the matching in-bailiwick
+A and AAAA records become the glue, with names compared label by label
+using ASCII case folding.
+
 Public API: encode_header, decode_header, encode_name, decode_name,
 encode_question, decode_question, encode_resource_record,
 decode_resource_record, encode_message, decode_message,
 synthesize_dname_cname, age_cached_records, lookup_cache, update_cache,
-DNSArgumentError, DNSMessageError.
+select_referral, DNSArgumentError, DNSMessageError.
 """
 
 import argparse
@@ -92,6 +98,7 @@ __all__ = [
     "age_cached_records",
     "lookup_cache",
     "update_cache",
+    "select_referral",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -198,6 +205,7 @@ MAX_MESSAGE_LENGTH = 65535
 MAX_COMPRESSION_POINTERS = 128
 MAX_DELEGATION_CUTS = 128
 MAX_CACHED_RECORDS = 128
+MAX_REFERRAL_RECORDS = 128
 _POINTER_BITS = 0xC0
 
 
@@ -1645,6 +1653,121 @@ def update_cache(records, stored_at, now, incoming):
     }
 
 
+def _validate_referral_records(records, name):
+    # Shared section validation for select_referral: shape, count and
+    # every record's public rules are checked here, including records
+    # that the selection will later ignore.
+    if not isinstance(records, (list, tuple)):
+        raise DNSArgumentError("%s must be a sequence" % name)
+    if len(records) > MAX_REFERRAL_RECORDS:
+        raise DNSArgumentError(
+            "%s exceeds %d entries" % (name, MAX_REFERRAL_RECORDS)
+        )
+    for record in records:
+        encode_resource_record(record)
+
+
+def _labels_at_or_below(name_labels, ancestor_labels):
+    # True when the already-lowercased ``name_labels`` equal
+    # ``ancestor_labels`` or lie below them in the DNS tree.
+    depth = len(ancestor_labels)
+    return (
+        len(name_labels) >= depth
+        and name_labels[len(name_labels) - depth :] == ancestor_labels
+    )
+
+
+def select_referral(qname, qclass, authorities, additionals):
+    """Extract a delegation referral from authority and additional data.
+
+    ``qname`` is the query name as an absolute ASCII domain name and
+    ``qclass`` a 16-bit unsigned integer (bools are never accepted).
+    ``authorities`` and ``additionals`` are each a list or tuple of at
+    most 128 resource record mappings following the
+    encode_resource_record rules (A, AAAA, CNAME, NS, DNAME, SOA, MX,
+    TXT or SRV); every record is fully validated before any result is
+    produced, including records the selection will ignore. Names are
+    matched label by label with ASCII case-insensitive comparison,
+    never as plain string prefixes or suffixes.
+
+    The delegation cut is the owner name of the NS records in
+    ``authorities`` whose class equals ``qclass`` and whose owner name
+    lies on the label ancestor path of ``qname`` (``qname`` itself
+    included), choosing the owner with the most labels. Every NS record
+    of that class and owner name enters ``nameservers`` in input order
+    and ``cut`` keeps the owner name of the first such record with its
+    original case. The glue is built from ``additionals``: the A and
+    AAAA records of that class whose owner name matches the target of
+    a selected nameserver and lies at or below the cut, in input order;
+    address records outside the cut, records of other types and
+    unrelated records are ignored. Returns a new mapping with the fixed
+    key order status, cut, nameservers, glue: ``status`` is "referral"
+    when a cut was found and "no-referral" otherwise, in which case
+    ``cut`` is None and both sequences are empty. Each returned record
+    is a new mapping in its type's fixed key order with the original
+    field values; the input containers, records and TXT strings are
+    never mutated and identical inputs produce identical results.
+    Raises DNSArgumentError for any invalid input.
+    """
+    # Validate everything before producing any result.
+    encode_name(qname)
+    _check_uint(qclass, "qclass", 16)
+    _validate_referral_records(authorities, "authorities")
+    _validate_referral_records(additionals, "additionals")
+
+    qname_labels = [label.lower() for label in _split_labels(qname)]
+
+    # The closest enclosing NS owner name wins the cut.
+    cut_labels = None
+    for record in authorities:
+        if record["type"] != _TYPE_NS or record["class"] != qclass:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(record["name"])]
+        if not _labels_at_or_below(qname_labels, owner_labels):
+            continue
+        if cut_labels is None or len(owner_labels) > len(cut_labels):
+            cut_labels = owner_labels
+
+    if cut_labels is None:
+        return {"status": "no-referral", "cut": None, "nameservers": [], "glue": []}
+
+    cut = None
+    nameservers = []
+    for record in authorities:
+        if record["type"] != _TYPE_NS or record["class"] != qclass:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(record["name"])]
+        if owner_labels != cut_labels:
+            continue
+        if cut is None:
+            cut = record["name"]
+        nameservers.append(_copy_cached_record(record))
+
+    targets = set()
+    for record in nameservers:
+        targets.add(tuple(label.lower() for label in _split_labels(record["target"])))
+
+    glue = []
+    for record in additionals:
+        if record["type"] != _TYPE_A and record["type"] != _TYPE_AAAA:
+            continue
+        if record["class"] != qclass:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(record["name"])]
+        if tuple(owner_labels) not in targets:
+            continue
+        if not _labels_at_or_below(owner_labels, cut_labels):
+            continue
+        glue.append(_copy_cached_record(record))
+
+    return {
+        "status": "referral",
+        "cut": cut,
+        "nameservers": nameservers,
+        "glue": glue,
+    }
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -1899,6 +2022,29 @@ def _cmd_update_cache():
     return 0
 
 
+_SELECT_REFERRAL_FIELDS = ("qname", "qclass", "authorities", "additionals")
+_SELECT_REFERRAL_FIELD_SET = frozenset(_SELECT_REFERRAL_FIELDS)
+
+
+def _cmd_select_referral():
+    obj = _read_json_object()
+    for field_name in _SELECT_REFERRAL_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _SELECT_REFERRAL_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = select_referral(
+        obj["qname"],
+        obj["qclass"],
+        obj["authorities"],
+        obj["additionals"],
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -1952,6 +2098,10 @@ def main(argv=None):
         "update-cache",
         help="read a UTF-8 JSON object with records, stored_at, now and incoming from stdin and print the updated cache snapshot as JSON",
     )
+    subparsers.add_parser(
+        "select-referral",
+        help="read a UTF-8 JSON object with qname, qclass, authorities and additionals from stdin and print the referral selection as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1977,7 +2127,9 @@ def main(argv=None):
             return _cmd_age_cache()
         if args.command == "lookup-cache":
             return _cmd_lookup_cache()
-        return _cmd_update_cache()
+        if args.command == "update-cache":
+            return _cmd_update_cache()
+        return _cmd_select_referral()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
 

@@ -33,9 +33,11 @@ name as RDATA, RFC 6672; no query rewriting or CNAME synthesis is
 performed here), SOA records (TYPE 6, two domain names
 followed by five 32-bit unsigned values, RFC 1035 section 3.3.13),
 MX records (TYPE 15, a 16-bit preference followed by a domain name
-as RDATA, RFC 1035 section 3.3.9) and
+as RDATA, RFC 1035 section 3.3.9),
 TXT records (TYPE 16, one or more length-prefixed character-strings as
-RDATA, RFC 1035 section 3.3.14) are supported here.
+RDATA, RFC 1035 section 3.3.14) and SRV records (TYPE 33, three 16-bit
+unsigned values priority, weight and port followed by a domain name as
+RDATA, RFC 2782) are supported here.
 
 A full message (RFC 1035 section 4.1) is the header followed by the
 question, answer, authority and additional sections; encode_message and
@@ -133,6 +135,17 @@ TXT_RECORD_FIELDS = ("name", "type", "class", "ttl", "strings")
 
 MX_RECORD_FIELDS = ("name", "type", "class", "ttl", "preference", "exchange")
 
+SRV_RECORD_FIELDS = (
+    "name",
+    "type",
+    "class",
+    "ttl",
+    "priority",
+    "weight",
+    "port",
+    "target",
+)
+
 _FLAG_FIELDS = frozenset(("qr", "aa", "tc", "rd", "ra"))
 _4BIT_FIELDS = frozenset(("opcode", "rcode"))
 _HEADER_STRUCT = struct.Struct("!HBBHHHH")
@@ -141,6 +154,7 @@ _RECORD_FIXED_STRUCT = struct.Struct("!HHIH")
 _AAAA_STRUCT = struct.Struct("!8H")
 _SOA_TIMERS_STRUCT = struct.Struct("!5I")
 _MX_PREFERENCE_STRUCT = struct.Struct("!H")
+_SRV_PARAMS_STRUCT = struct.Struct("!3H")
 _TYPE_A = 1
 _TYPE_NS = 2
 _TYPE_CNAME = 5
@@ -148,6 +162,7 @@ _TYPE_SOA = 6
 _TYPE_MX = 15
 _TYPE_TXT = 16
 _TYPE_AAAA = 28
+_TYPE_SRV = 33
 _TYPE_DNAME = 39
 _SUPPORTED_RECORD_TYPES = frozenset(
     (
@@ -158,6 +173,7 @@ _SUPPORTED_RECORD_TYPES = frozenset(
         _TYPE_MX,
         _TYPE_TXT,
         _TYPE_AAAA,
+        _TYPE_SRV,
         _TYPE_DNAME,
     )
 )
@@ -165,6 +181,7 @@ _A_RDATA_LENGTH = 4
 _AAAA_RDATA_LENGTH = 16
 _SOA_TIMERS_LENGTH = _SOA_TIMERS_STRUCT.size
 _MX_PREFERENCE_LENGTH = _MX_PREFERENCE_STRUCT.size
+_SRV_PARAMS_LENGTH = _SRV_PARAMS_STRUCT.size
 HEADER_SIZE = 12
 _INPUT_LIMIT = 4096
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -476,6 +493,7 @@ _RECORD_FIELD_SET = frozenset(
     + SOA_RECORD_FIELDS
     + TXT_RECORD_FIELDS
     + MX_RECORD_FIELDS
+    + SRV_RECORD_FIELDS
 )
 
 
@@ -631,6 +649,14 @@ def _reject_mx_fields(record):
             raise DNSArgumentError("unknown field: %s" % field_name)
 
 
+def _reject_srv_fields(record):
+    # ``target`` is shared with CNAME/NS/DNAME and is handled separately
+    # by each branch; only the SRV-specific numeric fields are rejected here.
+    for field_name in ("priority", "weight", "port"):
+        if field_name in record:
+            raise DNSArgumentError("unknown field: %s" % field_name)
+
+
 def _encode_txt_strings(strings):
     # Each element is an even-length hexadecimal string (either letter
     # case) standing for zero to 255 raw bytes; the wire form is a
@@ -663,17 +689,19 @@ def _encode_txt_strings(strings):
 
 
 def encode_resource_record(record):
-    """Encode one A, AAAA, CNAME, NS, DNAME, SOA, MX or TXT resource record mapping into wire bytes.
+    """Encode one A, AAAA, CNAME, NS, DNAME, SOA, MX, TXT or SRV resource record mapping into wire bytes.
 
     The mapping must contain exactly the keys name, type, class, ttl and
     address (A and AAAA), name, type, class, ttl and target (CNAME, NS
     and DNAME), name, type, class, ttl, mname, rname, serial, refresh,
     retry, expire and minimum (SOA), name, type, class, ttl, preference
-    and exchange (MX) or name, type, class, ttl and strings (TXT), in
+    and exchange (MX), name, type, class, ttl and strings (TXT) or
+    name, type, class, ttl, priority, weight, port and target (SRV), in
     any order. The name is written uncompressed;
     ``type`` must be the integer 1 (A), 2 (NS), 5 (CNAME), 6 (SOA), 15
     (MX), 16
-    (TXT), 28 (AAAA) or 39 (DNAME), ``class`` a 16-bit and ``ttl`` a
+    (TXT), 28 (AAAA), 33 (SRV) or 39 (DNAME), ``class`` a 16-bit and
+    ``ttl`` a
     32-bit unsigned integer (bools are never accepted). For type 1
     ``address`` is a dotted-decimal IPv4 string without leading zeros,
     for type 28 an IPv6 text form (either hex case, leading zeros,
@@ -701,7 +729,13 @@ def encode_resource_record(record):
     ``""`` for a zero-length segment), each standing for zero to 255
     raw bytes; RDATA is each segment as a one-octet length followed by
     the raw bytes, in order, and RDLENGTH is the total (never above
-    65535 bytes). Validation is completed before any result is
+    65535 bytes). For type 33 ``priority``, ``weight`` and ``port``
+    are 16-bit unsigned integers (bools are never accepted) and
+    ``target`` follows the same absolute ASCII domain name rules as
+    ``name`` (the root ``"."`` included); RDATA is the three values in
+    network byte order followed by the target name in uncompressed
+    wire form, and RDLENGTH is the actual total length. Validation is
+    completed before any result is
     produced; the caller's object is never mutated. Raises
     DNSArgumentError for any invalid input.
     """
@@ -731,6 +765,7 @@ def encode_resource_record(record):
             raise DNSArgumentError("unknown field: strings")
         _reject_soa_fields(record)
         _reject_mx_fields(record)
+        _reject_srv_fields(record)
         if "address" not in record:
             raise DNSArgumentError("missing field: address")
         if rtype == _TYPE_A:
@@ -744,6 +779,7 @@ def encode_resource_record(record):
             raise DNSArgumentError("unknown field: strings")
         _reject_soa_fields(record)
         _reject_mx_fields(record)
+        _reject_srv_fields(record)
         if "target" not in record:
             raise DNSArgumentError("missing field: target")
         rdata = encode_name(record["target"])
@@ -755,6 +791,7 @@ def encode_resource_record(record):
         if "strings" in record:
             raise DNSArgumentError("unknown field: strings")
         _reject_mx_fields(record)
+        _reject_srv_fields(record)
         rdata = _encode_soa_rdata(record)
     elif rtype == _TYPE_TXT:
         if "address" in record:
@@ -763,6 +800,7 @@ def encode_resource_record(record):
             raise DNSArgumentError("unknown field: target")
         _reject_soa_fields(record)
         _reject_mx_fields(record)
+        _reject_srv_fields(record)
         if "strings" not in record:
             raise DNSArgumentError("missing field: strings")
         rdata = _encode_txt_strings(record["strings"])
@@ -774,6 +812,7 @@ def encode_resource_record(record):
         if "strings" in record:
             raise DNSArgumentError("unknown field: strings")
         _reject_soa_fields(record)
+        _reject_srv_fields(record)
         if "preference" not in record:
             raise DNSArgumentError("missing field: preference")
         if "exchange" not in record:
@@ -783,10 +822,29 @@ def encode_resource_record(record):
         rdata = _MX_PREFERENCE_STRUCT.pack(preference) + encode_name(
             record["exchange"]
         )
+    elif rtype == _TYPE_SRV:
+        if "address" in record:
+            raise DNSArgumentError("unknown field: address")
+        if "strings" in record:
+            raise DNSArgumentError("unknown field: strings")
+        _reject_soa_fields(record)
+        _reject_mx_fields(record)
+        for field_name in ("priority", "weight", "port", "target"):
+            if field_name not in record:
+                raise DNSArgumentError("missing field: %s" % field_name)
+        priority = record["priority"]
+        weight = record["weight"]
+        port = record["port"]
+        _check_uint(priority, "priority", 16)
+        _check_uint(weight, "weight", 16)
+        _check_uint(port, "port", 16)
+        rdata = _SRV_PARAMS_STRUCT.pack(priority, weight, port) + encode_name(
+            record["target"]
+        )
     else:
         raise DNSArgumentError(
             "field 'type' must be 1 (A), 2 (NS), 5 (CNAME), 6 (SOA),"
-            " 15 (MX), 16 (TXT), 28 (AAAA) or 39 (DNAME)"
+            " 15 (MX), 16 (TXT), 28 (AAAA), 33 (SRV) or 39 (DNAME)"
         )
     _check_uint(rclass, "class", 16)
     _check_uint(ttl, "ttl", 32)
@@ -799,14 +857,15 @@ def encode_resource_record(record):
 
 
 def decode_resource_record(message, offset=0):
-    """Read one A, AAAA, CNAME, NS, DNAME, SOA, MX or TXT resource record from ``message``.
+    """Read one A, AAAA, CNAME, NS, DNAME, SOA, MX, TXT or SRV resource record from ``message``.
 
     Returns a ``(record, next_offset)`` tuple: ``record`` is a plain dict
     with keys in the fixed order name, type, class, ttl, address (A and
     AAAA), name, type, class, ttl, target (CNAME, NS and DNAME), name,
     type, class, ttl, mname, rname, serial, refresh, retry, expire,
-    minimum (SOA), name, type, class, ttl, preference, exchange (MX)
-    or name, type, class, ttl, strings (TXT), and
+    minimum (SOA), name, type, class, ttl, preference, exchange (MX),
+    name, type, class, ttl, strings (TXT) or name, type, class, ttl,
+    priority, weight, port, target (SRV), and
     ``next_offset`` is the first byte after the record's declared RDATA
     in the original message, regardless of any compression pointers
     inside it. The owner name follows the same compression-pointer
@@ -835,18 +894,26 @@ def decode_resource_record(message, offset=0):
     of length-prefixed character-strings (name compression is never
     interpreted there); ``strings`` keeps the segment order and
     renders each segment as lowercase hexadecimal (``""`` for a
-    zero-length segment). Raises DNSArgumentError for invalid
+    zero-length segment). SRV RDATA is read strictly inside the
+    declared RDLENGTH as priority, weight and port, three network-order
+    16-bit unsigned integers, followed by the target decoded as a
+    complete domain name (backward compression pointers accepted as
+    for decode_name, label case preserved, its raw encoding kept
+    inside the declared region), and the parse must end exactly at
+    the end of the declared region. Raises DNSArgumentError for invalid
     arguments and DNSMessageError for malformed wire data (truncated
     name, fixed fields or RDATA, a TYPE other than A, AAAA, CNAME,
-    NS, DNAME, SOA, MX or TXT, an RDLENGTH other than 4 for A or 16
-    for AAAA, a zero CNAME, NS, DNAME, SOA or TXT RDLENGTH, an MX
-    RDLENGTH below 2, a CNAME, NS
+    NS, DNAME, SOA, MX, TXT or SRV, an RDLENGTH other than 4 for A or
+    16 for AAAA, a zero CNAME, NS, DNAME, SOA or TXT RDLENGTH, an MX
+    RDLENGTH below 2, an SRV RDLENGTH below 6, a CNAME, NS
     or DNAME RDATA region that does not contain exactly one domain
     name, an SOA RDATA region that does not contain exactly mname,
     rname and five 32-bit integers, an MX RDATA region that does not
     contain exactly the preference and one domain name, a TXT RDATA
     region that does not decompose exactly into complete
-    character-strings, or a malformed
+    character-strings, an SRV RDATA region that does not contain
+    exactly the three 16-bit integers and one domain name, or a
+    malformed
     name or compression pointer); no partial result is returned on
     failure.
     """
@@ -884,12 +951,14 @@ def decode_resource_record(message, offset=0):
         or rtype == _TYPE_SOA
         or rtype == _TYPE_MX
         or rtype == _TYPE_TXT
+        or rtype == _TYPE_SRV
     ):
         expected_rdlength = None
     else:
         raise DNSMessageError(
             "unsupported record type: %d"
-            " (only A, AAAA, CNAME, NS, DNAME, SOA, MX and TXT are supported)"
+            " (only A, AAAA, CNAME, NS, DNAME, SOA, MX, TXT and SRV"
+            " are supported)"
             % rtype
         )
 
@@ -1018,6 +1087,43 @@ def decode_resource_record(message, offset=0):
             "exchange": exchange,
         }, rdata_end
 
+    if rtype == _TYPE_SRV:
+        if rdlength < _SRV_PARAMS_LENGTH:
+            raise DNSMessageError(
+                "SRV record RDLENGTH must be at least %d" % _SRV_PARAMS_LENGTH
+            )
+        if rdata_end > len(message):
+            raise DNSMessageError("truncated RDATA")
+        # The declared region holds priority, weight and port as three
+        # network-order 16-bit unsigned integers followed by exactly one
+        # complete domain name; the name's raw encoding must stay inside
+        # the region.
+        priority, weight, port = _SRV_PARAMS_STRUCT.unpack(
+            message[fixed_end : fixed_end + _SRV_PARAMS_LENGTH]
+        )
+        target_offset = fixed_end + _SRV_PARAMS_LENGTH
+        if target_offset >= rdata_end:
+            raise DNSMessageError(
+                "SRV RDATA must contain exactly priority, weight, port"
+                " and one domain name"
+            )
+        target, target_end = decode_name(message, target_offset)
+        if target_end != rdata_end:
+            raise DNSMessageError(
+                "SRV RDATA must contain exactly priority, weight, port"
+                " and one domain name"
+            )
+        return {
+            "name": name,
+            "type": rtype,
+            "class": rclass,
+            "ttl": ttl,
+            "priority": priority,
+            "weight": weight,
+            "port": port,
+            "target": target,
+        }, rdata_end
+
     if rdlength != expected_rdlength:
         raise DNSMessageError(
             "%s record RDLENGTH must be %d, got %d"
@@ -1124,8 +1230,8 @@ def decode_message(data):
     answers, authorities, additionals; each entry keeps the key order of
     decode_header, decode_question and decode_resource_record. The header
     is read first, then exactly qdcount questions and ancount, nscount
-    and arcount resource records (A, AAAA, CNAME, NS, DNAME, SOA, MX
-    and TXT only) are read
+    and arcount resource records (A, AAAA, CNAME, NS, DNAME, SOA, MX,
+    TXT and SRV only) are read
     from the same bytes; names may use the legal backward compression
     pointers accepted by decode_name. Raises DNSArgumentError when
     ``data`` is not bytes or exceeds 65535 bytes, and DNSMessageError
@@ -1293,6 +1399,7 @@ _AGE_RECORD_FIELDS = {
     _TYPE_SOA: SOA_RECORD_FIELDS,
     _TYPE_MX: MX_RECORD_FIELDS,
     _TYPE_TXT: TXT_RECORD_FIELDS,
+    _TYPE_SRV: SRV_RECORD_FIELDS,
 }
 
 
@@ -1346,7 +1453,7 @@ def age_cached_records(records, stored_at, now):
 
     ``records`` is a list or tuple of at most 128 resource record
     mappings, each following the encode_resource_record rules (A, AAAA,
-    CNAME, NS, DNAME, SOA, MX or TXT); ``stored_at`` and ``now`` are
+    CNAME, NS, DNAME, SOA, MX, TXT or SRV); ``stored_at`` and ``now`` are
     non-negative 64-bit integer timestamps in seconds (bools are never
     accepted) and ``now`` must not be earlier than ``stored_at``. No
     clock is read: the elapsed time is exactly ``now - stored_at``.
@@ -1376,12 +1483,14 @@ def lookup_cache(records, stored_at, now, qname, qtype, qclass):
 
     ``records`` is a list or tuple of at most 128 resource record
     mappings following the encode_resource_record rules (A, AAAA,
-    CNAME, NS, DNAME, SOA, MX or TXT); ``stored_at`` and ``now`` are
+    CNAME, NS, DNAME, SOA, MX, TXT or SRV); ``stored_at`` and ``now``
+    are
     non-negative 64-bit integer timestamps in seconds (bools are never
     accepted) and ``now`` must not be earlier than ``stored_at``.
     ``qname`` is an absolute ASCII domain name, ``qtype`` one of the
     supported record types 1 (A), 2 (NS), 5 (CNAME), 6 (SOA), 15 (MX),
-    16 (TXT), 28 (AAAA) or 39 (DNAME) and ``qclass`` a 16-bit unsigned
+    16 (TXT), 28 (AAAA), 33 (SRV) or 39 (DNAME) and ``qclass`` a 16-bit
+    unsigned
     integer (bools are never accepted). The whole snapshot is fully
     validated first and the timestamps are checked before the question
     is validated; no partial result is ever produced. Every record is
@@ -1413,7 +1522,7 @@ def lookup_cache(records, stored_at, now, qname, qtype, qclass):
     if qtype not in _SUPPORTED_RECORD_TYPES:
         raise DNSArgumentError(
             "field 'qtype' must be 1 (A), 2 (NS), 5 (CNAME), 6 (SOA),"
-            " 15 (MX), 16 (TXT), 28 (AAAA) or 39 (DNAME)"
+            " 15 (MX), 16 (TXT), 28 (AAAA), 33 (SRV) or 39 (DNAME)"
         )
     _check_uint(qclass, "qclass", 16)
 
@@ -1690,11 +1799,11 @@ def main(argv=None):
     )
     subparsers.add_parser(
         "encode-record",
-        help="read a UTF-8 JSON A/AAAA/CNAME/NS/DNAME/SOA/MX/TXT record object from stdin and print its hex wire form",
+        help="read a UTF-8 JSON A/AAAA/CNAME/NS/DNAME/SOA/MX/TXT/SRV record object from stdin and print its hex wire form",
     )
     subparsers.add_parser(
         "decode-record",
-        help="read hexadecimal wire bytes from stdin and print the A/AAAA/CNAME/NS/DNAME/SOA/MX/TXT record as JSON",
+        help="read hexadecimal wire bytes from stdin and print the A/AAAA/CNAME/NS/DNAME/SOA/MX/TXT/SRV record as JSON",
     )
     subparsers.add_parser(
         "encode-message",

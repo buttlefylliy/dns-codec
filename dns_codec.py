@@ -94,6 +94,13 @@ label with ASCII case folding) before consulting the response TC flag
 and the transport. No clock or network is read and no hidden state is
 kept.
 
+lookup_negative_cache answers a DNS question against a snapshot of
+negative cache entries (NXDOMAIN and NODATA): after full validation and
+uniform aging by an explicitly supplied pair of timestamps, live
+NXDOMAIN entries match on name and class for any qtype and, only when
+no such entry matches, live NODATA entries match on name, type and
+class. No clock is read and no hidden state is involved.
+
 extract_nxdomain_cache turns an authoritative NXDOMAIN response into a
 negative cache entry: after the same full validation and correlation of
 the query and the response it selects the deepest same-class SOA in the
@@ -115,7 +122,7 @@ decode_resource_record, encode_message, decode_message,
 synthesize_dname_cname, age_cached_records, lookup_cache,
 lookup_cache_chain, update_cache,
 select_referral, plan_truncation_retry, plan_response_acceptance,
-extract_nxdomain_cache, extract_nodata_cache,
+extract_nxdomain_cache, extract_nodata_cache, lookup_negative_cache,
 DNSArgumentError, DNSMessageError.
 """
 
@@ -146,6 +153,7 @@ __all__ = [
     "plan_response_acceptance",
     "extract_nxdomain_cache",
     "extract_nodata_cache",
+    "lookup_negative_cache",
     "DNSArgumentError",
     "DNSMessageError",
 ]
@@ -256,6 +264,7 @@ MAX_MESSAGE_LENGTH = 65535
 MAX_COMPRESSION_POINTERS = 128
 MAX_DELEGATION_CUTS = 128
 MAX_CACHED_RECORDS = 128
+MAX_NEGATIVE_ENTRIES = 128
 MAX_REFERRAL_RECORDS = 128
 MAX_CHAIN_HOPS = 16
 _POINTER_BITS = 0xC0
@@ -2343,6 +2352,128 @@ def extract_nodata_cache(query, response):
     return result
 
 
+# Fixed key orders of the two negative cache entry shapes.
+_NXDOMAIN_ENTRY_FIELDS = ("name", "class", "ttl")
+_NODATA_ENTRY_FIELDS = ("name", "type", "class", "ttl")
+_NEGATIVE_ENTRY_FIELD_SET = frozenset(("name", "type", "class", "ttl"))
+
+
+def _validate_negative_entries(entries):
+    # Snapshot validation for lookup_negative_cache: shape, count and
+    # every entry's public rules are checked here. An entry is either an
+    # NXDOMAIN entry (exactly name, class, ttl) or a NODATA entry
+    # (exactly name, type, class, ttl).
+    if not isinstance(entries, (list, tuple)):
+        raise DNSArgumentError("entries must be a sequence")
+    if len(entries) > MAX_NEGATIVE_ENTRIES:
+        raise DNSArgumentError(
+            "entries exceeds %d entries" % MAX_NEGATIVE_ENTRIES
+        )
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise DNSArgumentError("entry must be a mapping")
+        for key in entry:
+            if key not in _NEGATIVE_ENTRY_FIELD_SET:
+                raise DNSArgumentError("unknown field: %s" % key)
+        for field_name in _NXDOMAIN_ENTRY_FIELDS:
+            if field_name not in entry:
+                raise DNSArgumentError("missing field: %s" % field_name)
+        encode_name(entry["name"])
+        if "type" in entry:
+            _check_uint(entry["type"], "type", 16)
+        _check_uint(entry["class"], "class", 16)
+        _check_uint(entry["ttl"], "ttl", 32)
+
+
+def lookup_negative_cache(entries, stored_at, now, qname, qtype, qclass):
+    """Answer a DNS question against a negative cache snapshot.
+
+    ``entries`` is a list or tuple of at most 128 negative cache entry
+    mappings: an NXDOMAIN entry carries exactly the keys name, class and
+    ttl, a NODATA entry exactly name, type, class and ttl. ``name`` is
+    an absolute ASCII domain name, ``class`` and ``type`` are 16-bit
+    unsigned integers and ``ttl`` a 32-bit unsigned integer (bools are
+    never accepted). ``stored_at`` and ``now`` are non-negative 64-bit
+    integer timestamps in seconds (bools are never accepted) and ``now``
+    must not be earlier than ``stored_at``. ``qname`` is an absolute
+    ASCII domain name and ``qtype`` and ``qclass`` are 16-bit unsigned
+    integers (bools are never accepted). The whole snapshot is fully
+    validated before any result is produced; no partial result is ever
+    returned. Every entry is then aged uniformly by ``now - stored_at``:
+    a TTL less than or equal to the elapsed time expires, so a zero TTL
+    expires even when ``now`` equals ``stored_at``.
+
+    Among the surviving entries an NXDOMAIN entry whose name and class
+    match the question hits for any qtype; only when no NXDOMAIN entry
+    hits, a NODATA entry whose name, type and class all match hits.
+    Names are compared label by label with ASCII case-insensitive
+    matching, never as plain string prefixes or suffixes, while type
+    and class are exact integer matches. Returns a new mapping with the
+    fixed key order status, entries, expired: ``status`` is "nxdomain"
+    when at least one NXDOMAIN entry hits, "nodata" when only NODATA
+    entries hit and "miss" otherwise; ``entries`` holds the matching
+    entries in input order, each a new mapping in its shape's fixed key
+    order (name, class, ttl or name, type, class, ttl) with the
+    original name case and the TTL replaced by the remaining lifetime
+    (empty on a miss), and ``expired`` is the number of entries that
+    expired across the whole snapshot during this aging pass. The input
+    containers and entries are never mutated, no clock is read and
+    identical inputs produce identical results. Raises
+    DNSArgumentError for any invalid input.
+    """
+    # Validate the whole snapshot before the question, as contracted.
+    _validate_negative_entries(entries)
+    _check_cache_timestamps(stored_at, now)
+
+    encode_name(qname)
+    _check_uint(qtype, "qtype", 16)
+    _check_uint(qclass, "qclass", 16)
+
+    elapsed = now - stored_at
+    wanted_labels = [label.lower() for label in _split_labels(qname)]
+
+    expired = 0
+    nxdomain_hits = []
+    nodata_hits = []
+    for entry in entries:
+        ttl = entry["ttl"]
+        if ttl <= elapsed:
+            expired += 1
+            continue
+        if entry["class"] != qclass:
+            continue
+        owner_labels = [label.lower() for label in _split_labels(entry["name"])]
+        if owner_labels != wanted_labels:
+            continue
+        remaining = ttl - elapsed
+        if "type" in entry:
+            if entry["type"] != qtype:
+                continue
+            nodata_hits.append(
+                {
+                    "name": entry["name"],
+                    "type": entry["type"],
+                    "class": entry["class"],
+                    "ttl": remaining,
+                }
+            )
+        else:
+            # An NXDOMAIN entry denies every qtype of the name.
+            nxdomain_hits.append(
+                {
+                    "name": entry["name"],
+                    "class": entry["class"],
+                    "ttl": remaining,
+                }
+            )
+
+    if nxdomain_hits:
+        return {"status": "nxdomain", "entries": nxdomain_hits, "expired": expired}
+    if nodata_hits:
+        return {"status": "nodata", "entries": nodata_hits, "expired": expired}
+    return {"status": "miss", "entries": [], "expired": expired}
+
+
 def _read_json_object():
     # Shared input path for the encode commands: a bounded stdin read
     # that must yield one UTF-8 JSON object.
@@ -2725,6 +2856,38 @@ def _cmd_extract_nodata_cache():
     return 0
 
 
+_LOOKUP_NEGATIVE_CACHE_FIELDS = (
+    "entries",
+    "stored_at",
+    "now",
+    "qname",
+    "qtype",
+    "qclass",
+)
+_LOOKUP_NEGATIVE_CACHE_FIELD_SET = frozenset(_LOOKUP_NEGATIVE_CACHE_FIELDS)
+
+
+def _cmd_lookup_negative_cache():
+    obj = _read_json_object()
+    for field_name in _LOOKUP_NEGATIVE_CACHE_FIELDS:
+        if field_name not in obj:
+            raise DNSArgumentError("missing field: %s" % field_name)
+    for key in obj:
+        if key not in _LOOKUP_NEGATIVE_CACHE_FIELD_SET:
+            raise DNSArgumentError("unknown field: %s" % key)
+    result = lookup_negative_cache(
+        obj["entries"],
+        obj["stored_at"],
+        obj["now"],
+        obj["qname"],
+        obj["qtype"],
+        obj["qclass"],
+    )
+    output = json.dumps(result, separators=(",", ":"))
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="dns_codec", description="DNS message encoder/decoder."
@@ -2802,6 +2965,10 @@ def main(argv=None):
         "extract-nodata-cache",
         help="read a UTF-8 JSON object with query and response from stdin and print the NODATA negative cache decision as JSON",
     )
+    subparsers.add_parser(
+        "lookup-negative-cache",
+        help="read a UTF-8 JSON object with entries, stored_at, now, qname, qtype and qclass from stdin and print the negative cache lookup result as JSON",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -2839,6 +3006,8 @@ def main(argv=None):
             return _cmd_extract_nxdomain_cache()
         if args.command == "extract-nodata-cache":
             return _cmd_extract_nodata_cache()
+        if args.command == "lookup-negative-cache":
+            return _cmd_lookup_negative_cache()
         return _cmd_plan_response_acceptance()
     except (DNSArgumentError, DNSMessageError) as exc:
         return _write_error(exc)
